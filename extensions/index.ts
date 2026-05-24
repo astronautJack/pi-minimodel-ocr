@@ -120,6 +120,12 @@ const glmOcrSchema = Type.Object({
 				'OCR task type. "text" for Markdown text, "formula" for LaTeX math, "table" for Markdown tables, "figure" for description, "auto" for full document OCR (default).',
 		}),
 	),
+	model: Type.Optional(
+		Type.String({
+			description:
+				"Ollama model to use for OCR. Defaults to 'glm-ocr'. You can use any Ollama vision model, e.g. 'glm-ocr:q8_0' for the 8-bit quantized version, 'llama3.2-vision', 'minicpm-v', etc.",
+		}),
+	),
 });
 
 const glmOcrTool = defineTool({
@@ -138,11 +144,16 @@ const glmOcrTool = defineTool({
 	],
 	parameters: glmOcrSchema,
 	async execute(_toolCallId, params, signal, onUpdate, ctx) {
-		const { path: filePath, task = "auto" } = params as { path: string; task?: string };
+		const { path: filePath, task = "auto", model: modelOverride } = params as {
+			path: string;
+			task?: string;
+			model?: string;
+		};
 		const resolvedTask = (TASKS.includes(task as Task) ? task : "auto") as Task;
 
-		// Resolve config
+		// Resolve config (modelOverride takes priority over env/config)
 		const config = getConfig(ctx);
+		const resolvedModel = modelOverride || config.model;
 
 		// Validate file
 		if (!existsSync(filePath)) {
@@ -169,7 +180,7 @@ const glmOcrTool = defineTool({
 
 		// Progress update
 		onUpdate?.({
-			content: [{ type: "text", text: `🔍 Reading ${basename(filePath)} with GLM-OCR (${resolvedTask})…` }],
+			content: [{ type: "text", text: `🔍 Reading ${basename(filePath)} with ${resolvedModel} (${resolvedTask})…` }],
 			details: {},
 		});
 
@@ -203,14 +214,14 @@ const glmOcrTool = defineTool({
 						details: {},
 					});
 
-					const pageText = await callGlmOcr(config, pageOut, resolvedTask, signal);
+					const pageText = await callGlmOcr(config, pageOut, resolvedTask, signal, resolvedModel);
 					pageResults.push(`## Page ${i + 1}\n\n${pageText}`);
 				}
 
 				resultText = pageResults.join("\n\n");
 			} else {
 				// ── Image: process directly ───────────────────────────────
-				resultText = await callGlmOcr(config, filePath, resolvedTask, signal);
+				resultText = await callGlmOcr(config, filePath, resolvedTask, signal, resolvedModel);
 			}
 
 			// Build summary
@@ -228,7 +239,7 @@ const glmOcrTool = defineTool({
 					path: filePath,
 					fullText: resultText,
 					truncated: resultText.length > 5000,
-					model: config.model,
+					model: resolvedModel,
 				},
 			};
 		} catch (e: any) {
@@ -270,12 +281,14 @@ async function callGlmOcr(
 	imagePath: string,
 	task: Task,
 	signal?: AbortSignal,
+	modelOverride?: string,
 ): Promise<string> {
 	const imageBase64 = readFileSync(imagePath).toString("base64");
 	const prompt = buildPrompt(task);
+	const model = modelOverride || config.model;
 
 	const body = JSON.stringify({
-		model: config.model,
+		model,
 		prompt,
 		images: [imageBase64],
 		stream: false,
@@ -291,7 +304,7 @@ async function callGlmOcr(
 	if (!response.ok) {
 		const text = await response.text().catch(() => "");
 		throw new Error(
-			`Ollama API error ${response.status}: ${text.slice(0, 200)}. Is Ollama running and is the ${config.model} model pulled?`,
+			`Ollama API error ${response.status}: ${text.slice(0, 200)}. Is Ollama running and is the ${model} model pulled?`,
 		);
 	}
 
@@ -417,14 +430,16 @@ export default function glmOcrExtension(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const trimmed = (args || "").trim();
 			if (!trimmed) {
-				ctx.ui.notify("Usage: /glm-ocr <file-path> [task]", "info");
+				ctx.ui.notify("Usage: /glm-ocr <file-path> [task] [model]", "info");
 				ctx.ui.notify("Tasks: text, formula, table, figure, auto (default)", "info");
+				ctx.ui.notify("Model: any Ollama vision model (default: glm-ocr)", "info");
 				return;
 			}
 
 			const parts = trimmed.split(/\s+/);
 			const filePath = parts[0];
 			const task = parts[1] || "auto";
+			const model = parts[2] || undefined;
 
 			if (!existsSync(filePath)) {
 				ctx.ui.notify(`File not found: ${filePath}`, "error");
@@ -432,7 +447,7 @@ export default function glmOcrExtension(pi: ExtensionAPI) {
 			}
 
 			// Call the tool directly
-			const result = await glmOcrTool.execute("", { path: filePath, task }, undefined as any, undefined, ctx);
+			const result = await glmOcrTool.execute("", { path: filePath, task, model }, undefined as any, undefined, ctx);
 
 			if (result.isError) {
 				const msg =

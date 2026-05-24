@@ -71,6 +71,7 @@ The extension registers a `glm_ocr` tool that the agent can call automatically. 
 
 ```bash
 /glm-ocr ./screenshot.png formula
+/glm-ocr ./screenshot.png auto glm-ocr:q8_0
 /glm-ocr ./document.pdf auto
 /glm-ocr ./table.png table
 /glm-ocr ./diagram.png figure
@@ -89,11 +90,24 @@ The extension registers a `glm_ocr` tool that the agent can call automatically. 
 
 ## Configuration
 
-Optional environment variables:
+### Model Selection
+
+You can override the model per-call:
+
+```bash
+# Via command - 3rd argument is the model
+/glm-ocr ./image.png formula glm-ocr:q8_0
+/glm-ocr ./paper.pdf auto llama3.2-vision
+
+# Via LLM - the agent can specify the model parameter
+# Example: "use glm_ocr with model='minicpm-v' to read this image"
+```
+
+### Environment Variables
 
 ```bash
 export OLLAMA_HOST="http://localhost:11434"  # default
-export GLM_OCR_MODEL="glm-ocr"                # default
+export GLM_OCR_MODEL="glm-ocr"                # default model
 ```
 
 Or in `~/.pi/agent/settings.json`:
