@@ -1,0 +1,47 @@
+{
+  "name": "pi-glm-ocr",
+  "version": "0.1.0",
+  "description": "Pi extension: Local OCR via Ollama GLM-OCR (0.9B) — convert images and PDFs to Markdown / LaTeX with high math formula accuracy. Bridges the multimodal gap for non-vision LLMs like DeepSeek.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "coding-agent",
+    "ocr",
+    "glm-ocr",
+    "ollama",
+    "latex",
+    "math-ocr",
+    "formula-recognition",
+    "image-to-text",
+    "pdf-to-markdown",
+    "deepseek"
+  ],
+  "license": "MIT",
+  "author": "",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/astronautJack/pi-glm-ocr.git"
+  },
+  "files": [
+    "extensions/",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^25.9.1",
+    "typebox": "*",
+    "typescript": "^6.0.3"
+  }
+}
