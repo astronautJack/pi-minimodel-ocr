@@ -326,6 +326,33 @@ function setModel(model: string): void {
 	recentModels = [model, ...recentModels.filter((m) => m !== model)].slice(0, 10);
 }
 
+/** Check if a model exists locally via Ollama API. Returns true if pulled. */
+async function checkModelExists(host: string, model: string): Promise<boolean> {
+	try {
+		const resp = await fetch(`${host}/api/show`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ name: model }),
+		});
+		return resp.ok;
+	} catch {
+		return false;
+	}
+}
+
+/** Pull a model via Ollama API (fire-and-forget, can take minutes) */
+async function pullModel(host: string, model: string): Promise<void> {
+	const resp = await fetch(`${host}/api/pull`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ name: model, stream: false }),
+	});
+	if (!resp.ok) {
+		const text = await resp.text().catch(() => "");
+		throw new Error(`Pull failed (${resp.status}): ${text.slice(0, 200)}`);
+	}
+}
+
 // ── Ollama API ──────────────────────────────────────────────────────────────
 
 async function callOcr(
@@ -568,6 +595,25 @@ export default function ocrExtension(pi: ExtensionAPI) {
 
 				// Extract model name from selection (strip hint part)
 				const newModel = choice.split(/\s+→/)[0].trim();
+
+				// Verify the model exists locally
+				const exists = await checkModelExists(config.ollamaHost, newModel);
+				if (!exists) {
+					const pull = await ctx.ui.confirm(
+						"Model not found",
+						`${newModel} is not pulled.\n\nPull it now? (ollama pull ${newModel})`,
+					);
+					if (!pull) return;
+					ctx.ui.notify(`Pulling ${newModel}…`, "info");
+					// Fire-and-forget pull (takes a while)
+					pullModel(config.ollamaHost, newModel).then(() => {
+						ctx.ui.notify(`${newModel} pull complete`, "success");
+					}).catch((e) => {
+						ctx.ui.notify(`Pull failed: ${e.message}`.slice(0, 200), "error");
+					});
+					// Apply the model anyway so user doesn't lose their choice
+				}
+
 				setModel(newModel);
 
 				pi.appendEntry<PersistedState>("ocr-model-config", {
@@ -576,11 +622,28 @@ export default function ocrExtension(pi: ExtensionAPI) {
 				});
 
 				ctx.ui.setStatus("minimodel-ocr", `OCR: ${newModel} @ ${config.ollamaHost}`);
-				ctx.ui.notify(`OCR model → ${newModel}`, "success");
+				ctx.ui.notify(`OCR model → ${newModel}` + (exists ? "" : " (pulling…)"), "success");
 				return;
 			}
 
 			const newModel = trimmed.split(/\s+/)[0];
+
+			// Verify the model exists locally
+			const exists = await checkModelExists(config.ollamaHost, newModel);
+			if (!exists) {
+				const pull = await ctx.ui.confirm(
+					"Model not found",
+					`${newModel} is not pulled.\n\nPull it now? (ollama pull ${newModel})`,
+				);
+				if (!pull) return;
+				ctx.ui.notify(`Pulling ${newModel}…`, "info");
+				pullModel(config.ollamaHost, newModel).then(() => {
+					ctx.ui.notify(`${newModel} pull complete`, "success");
+				}).catch((e) => {
+					ctx.ui.notify(`Pull failed: ${e.message}`.slice(0, 200), "error");
+				});
+			}
+
 			setModel(newModel);
 
 			pi.appendEntry<PersistedState>("ocr-model-config", {
@@ -589,7 +652,7 @@ export default function ocrExtension(pi: ExtensionAPI) {
 			});
 
 			ctx.ui.setStatus("minimodel-ocr", `OCR: ${newModel} @ ${config.ollamaHost}`);
-			ctx.ui.notify(`OCR model → ${newModel}`, "success");
+			ctx.ui.notify(`OCR model → ${newModel}` + (exists ? "" : " (pulling…)"), "success");
 		},
 	});
 
