@@ -246,7 +246,11 @@ const ocrTool = defineTool({
 					});
 
 					const pageText = await callOcr(config, pageOut, resolvedTask, signal, resolvedModel);
-					pageResults.push(`## Page ${i + 1}\n\n${pageText}`);
+					if (!pageText.trim()) {
+						pageResults.push(`## Page ${i + 1}\n\n> ⚠️ OCR returned empty result for this page.`);
+					} else {
+						pageResults.push(`## Page ${i + 1}\n\n${pageText}`);
+					}
 				}
 
 				resultText = pageResults.join("\n\n");
@@ -420,7 +424,7 @@ async function convertPdfPageMac(pdfPath: string, pageIndex: number, outPath: st
 		}
 	}
 
-	// Page > 1: use pdftoppm
+	// Page > 0: use pdftoppm
 	try {
 		await execCmdCapture("pdftoppm", [
 			"-png", "-r", "200",
@@ -430,12 +434,20 @@ async function convertPdfPageMac(pdfPath: string, pageIndex: number, outPath: st
 			pdfPath,
 			outPath.replace(/\.png$/, ""),
 		]);
+		// Verify the output file actually exists
+		if (!existsSync(outPath) || readFileSync(outPath).length === 0) {
+			throw new Error(`pdftoppm produced no output for page ${pageIndex + 1}`);
+		}
 		return;
 	} catch (e: any) {
-		throw new Error(
-			`Multi-page PDF requires pdftoppm (brew install poppler). ` +
-			`Only page 1 was processed with sips.`,
-		);
+		const msg = e.message || String(e);
+		if (msg.includes("command not found") || msg.includes("ENOENT")) {
+			throw new Error(
+				`pdftoppm not found. Install with: brew install poppler. ` +
+				`Only page 1 was processed with sips.`,
+			);
+		}
+		throw new Error(`PDF page ${pageIndex + 1} conversion failed: ${msg}`);
 	}
 }
 
