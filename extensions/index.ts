@@ -293,19 +293,21 @@ const ocrTool = defineTool({
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
-let cachedConfig: OcrConfig | null = null;
+let currentModel: string | null = null;
+let ollamaHost: string | null = null;
 
 function getConfig(_ctx?: ExtensionContext): OcrConfig {
-	if (cachedConfig) return cachedConfig;
+	if (ollamaHost === null) {
+		ollamaHost = process.env.OLLAMA_HOST || "http://localhost:11434";
+	}
+	if (currentModel === null) {
+		currentModel = process.env.OCR_MODEL || "glm-ocr";
+	}
+	return { ollamaHost, model: currentModel };
+}
 
-	const envHost = process.env.OLLAMA_HOST || "http://localhost:11434";
-	const envModel = process.env.OCR_MODEL || "glm-ocr";
-
-	cachedConfig = {
-		ollamaHost: envHost,
-		model: envModel,
-	};
-	return cachedConfig;
+function setModel(model: string): void {
+	currentModel = model;
 }
 
 // ── Ollama API ──────────────────────────────────────────────────────────────
@@ -500,6 +502,33 @@ export default function ocrExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	// Register /ocr-model command to view/change the default OCR model
+	pi.registerCommand("ocr-model", {
+		description: "View or change the default OCR model (persists for the session)",
+		handler: async (args, ctx) => {
+			const trimmed = (args || "").trim();
+			const config = getConfig(ctx);
+
+			if (!trimmed) {
+				// Show current model
+				ctx.ui.notify(`Current OCR model: ${config.model}`, "info");
+				ctx.ui.notify("To change: /ocr-model <model-name>", "info");
+				ctx.ui.notify('Examples: /ocr-model glm-ocr:q8_0, /ocr-model llama3.2-vision', "info");
+				return;
+			}
+
+			// Change model
+			const newModel = trimmed.split(/\s+/)[0];
+			setModel(newModel);
+
+			ctx.ui.setStatus(
+				"minimodel-ocr",
+				`OCR: ${newModel} @ ${config.ollamaHost}`,
+			);
+			ctx.ui.notify(`OCR model changed to: ${newModel}`, "success");
+		},
+	});
+
 	// Notify on startup
 	pi.on("session_start", async (_event, ctx) => {
 		const config = getConfig(ctx);
@@ -521,5 +550,5 @@ export default function ocrExtension(pi: ExtensionAPI) {
 		}
 	});
 
-	console.log("[pi-minimodel-ocr] Extension loaded. Tool: minimodel_ocr, Command: /ocr");
+	console.log("[pi-minimodel-ocr] Extension loaded. Tool: minimodel_ocr, Commands: /ocr, /ocr-model");
 }
