@@ -340,17 +340,9 @@ async function checkModelExists(host: string, model: string): Promise<boolean> {
 	}
 }
 
-/** Pull a model via Ollama API (fire-and-forget, can take minutes) */
-async function pullModel(host: string, model: string): Promise<void> {
-	const resp = await fetch(`${host}/api/pull`, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ name: model, stream: false }),
-	});
-	if (!resp.ok) {
-		const text = await resp.text().catch(() => "");
-		throw new Error(`Pull failed (${resp.status}): ${text.slice(0, 200)}`);
-	}
+/** Pull a model via `ollama pull` (fire-and-forget, can take minutes) */
+async function pullModel(model: string): Promise<void> {
+	await execCmdCapture("ollama", ["pull", model]);
 }
 
 // ── Ollama API ──────────────────────────────────────────────────────────────
@@ -606,7 +598,7 @@ export default function ocrExtension(pi: ExtensionAPI) {
 					if (!pull) return;
 					ctx.ui.notify(`Pulling ${newModel}…`, "info");
 					// Fire-and-forget pull (takes a while)
-					pullModel(config.ollamaHost, newModel).then(() => {
+					pullModel(newModel).then(() => {
 						ctx.ui.notify(`${newModel} pull complete`, "success");
 					}).catch((e) => {
 						ctx.ui.notify(`Pull failed: ${e.message}`.slice(0, 200), "error");
@@ -637,7 +629,7 @@ export default function ocrExtension(pi: ExtensionAPI) {
 				);
 				if (!pull) return;
 				ctx.ui.notify(`Pulling ${newModel}…`, "info");
-				pullModel(config.ollamaHost, newModel).then(() => {
+				pullModel(newModel).then(() => {
 					ctx.ui.notify(`${newModel} pull complete`, "success");
 				}).catch((e) => {
 					ctx.ui.notify(`Pull failed: ${e.message}`.slice(0, 200), "error");
