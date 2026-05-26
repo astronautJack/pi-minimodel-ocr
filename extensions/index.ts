@@ -339,40 +339,9 @@ async function checkModelExists(host: string, model: string): Promise<boolean> {
 	}
 }
 
-/** Pull a model via `ollama pull` with live progress via widget */
-async function pullModel(model: string, ctx: ExtensionContext): Promise<void> {
-	return new Promise((resolve, reject) => {
-		const child = spawn("ollama", ["pull", model], { stdio: ["ignore", "pipe", "pipe"] });
-		const lines: string[] = [];
-
-		child.stdout.on("data", (d: Buffer) => {
-			const text = d.toString("utf8");
-			for (const line of text.split("\n")) {
-				const trimmed = line.trim();
-				if (trimmed) lines.push(trimmed);
-			}
-			ctx.ui.setWidget?.(`ocr-pull-${model}`, lines.slice(-5));
-		});
-
-		child.stderr.on("data", (d: Buffer) => {
-			const text = d.toString("utf8");
-			for (const line of text.split("\n")) {
-				const trimmed = line.trim();
-				if (trimmed) lines.push(`⚠ ${trimmed}`);
-			}
-		});
-
-		child.on("error", (e) => {
-			ctx.ui.clearWidget?.(`ocr-pull-${model}`);
-			reject(e);
-		});
-
-		child.on("close", (code) => {
-			ctx.ui.clearWidget?.(`ocr-pull-${model}`);
-			if (code === 0) resolve();
-			else reject(new Error(`ollama pull exited with code ${code}`));
-		});
-	});
+/** Pull a model via `ollama pull` */
+async function pullModel(model: string): Promise<void> {
+	await execCmdCapture("ollama", ["pull", model]);
 }
 
 // ── Ollama API ──────────────────────────────────────────────────────────────
@@ -631,7 +600,7 @@ export default function ocrExtension(pi: ExtensionAPI) {
 			);
 			if (!pull) return;
 			ctx.ui.notify(`Pulling ${newModel}…`, "info");
-			pullModel(newModel, ctx).then(() => {
+			pullModel(newModel).then(() => {
 				ctx.ui.notify(`${newModel} pull complete`, "success");
 			}).catch((e) => {
 				ctx.ui.notify(`Pull failed: ${e.message}`.slice(0, 200), "error");
