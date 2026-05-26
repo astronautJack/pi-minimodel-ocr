@@ -383,7 +383,7 @@ async function convertPdfPage(pdfPath: string, pageIndex: number, outPath: strin
 		await convertPdfPageMac(pdfPath, pageIndex, outPath);
 	} else {
 		await execCmdCapture("pdftoppm", [
-			"-png", "-r", "200",
+			"-png", "-r", "150",
 			"-f", String(pageIndex + 1),
 			"-l", String(pageIndex + 1),
 			"-singlefile",
@@ -427,7 +427,7 @@ async function convertPdfPageMac(pdfPath: string, pageIndex: number, outPath: st
 	// Page > 0: use pdftoppm
 	try {
 		await execCmdCapture("pdftoppm", [
-			"-png", "-r", "200",
+			"-png", "-r", "150",
 			"-f", String(pageIndex + 1),
 			"-l", String(pageIndex + 1),
 			"-singlefile",
