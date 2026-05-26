@@ -1,48 +1,41 @@
 # pi-minimodel-ocr
 
-**Local OCR for Pi Coding Agent** — extract text, LaTeX math formulas, and tables from images and PDFs using [GLM-OCR](https://ollama.com/library/glm-ocr) (0.9B) via Ollama.
+Local OCR for [Pi Coding Agent](https://pi.dev) — extract text, LaTeX math formulas, and tables from images and PDFs using small vision models via [Ollama](https://ollama.com).
 
-> Bridges the multimodal gap for non-vision LLMs like **DeepSeek**. When your model can't see images or PDFs, `pi-glm-ocr` acts as its eyes — with high-accuracy formula recognition outputting LaTeX.
+> Bridges the multimodal gap for non-vision LLMs like **DeepSeek**. When your model can't see images, `glm_ocr` acts as its eyes — with state-of-the-art formula recognition outputting LaTeX.
 
 ## Features
 
-- 🔍 **Text Recognition** — Extracts text as Markdown from images and PDFs
-- 🧮 **Formula Recognition** — Math formulas output in LaTeX with high accuracy
-- 📊 **Table Recognition** — Tables extracted as Markdown tables
-- 🖼️ **Figure Description** — Describes figures and diagrams
-- 📄 **PDF Support** — Converts PDF pages to images automatically (macOS/Linux)
-- 📦 **Fully local** — No API keys, no cloud, no data leaves your machine
+| | |
+|---|---|
+| 🔤 **Text** | General text recognition → Markdown |
+| 🧮 **Formulas** | Math formulas → LaTeX with high accuracy |
+| 📊 **Tables** | Table structure → Markdown tables |
+| 🖼️ **Figures** | Diagrams and illustrations → descriptions |
+| 📄 **PDF** | Full PDF support with per-page conversion (macOS / Linux / WSL) |
+| 🎛️ **Any model** | Defaults to `glm-ocr` (0.9B) but works with any Ollama vision model |
+| 🔒 **100% local** | No API keys, no cloud, no data ever leaves your machine |
 
-## Prerequisites
+## Quickstart
 
-1. **Install Ollama** (if not already):
-   ```bash
-   # macOS
-   brew install ollama
-   # or download from https://ollama.com/download
+### 1. Prerequisites
 
-   # Linux
-   curl -fsSL https://ollama.com/install.sh | sh
-   ```
+```bash
+# Install Ollama
+brew install ollama                     # macOS
+curl -fsSL https://ollama.com/install.sh | sh  # Linux
 
-2. **Pull the GLM-OCR model:**
-   ```bash
-   ollama pull glm-ocr
-   ```
-   Model size: ~2.2 GB (bf16) or ~1.6 GB (q8_0 variant)
+# Pull the default OCR model (~2.2 GB)
+ollama pull glm-ocr
 
-3. **For PDF support on Linux/WSL:**
-   ```bash
-   sudo apt install poppler-utils
-   ```
-   macOS uses built-in `sips` — no extra dependencies needed for single-page PDFs.
-   For multi-page PDFs on macOS, install either:
-   ```bash
-   brew install poppler          # recommended
-   pip install pyobjc-framework-Quartz  # alternative
-   ```
+# Linux/WSL PDF support
+sudo apt install poppler-utils
+```
 
-## Install
+> macOS uses built-in `sips` for single-page PDFs — zero extra deps.  
+> Multi-page PDFs on macOS need `brew install poppler` or `pip install pyobjc-framework-Quartz`.
+
+### 2. Install
 
 ```bash
 pi install npm:pi-minimodel-ocr
@@ -56,66 +49,78 @@ pi -e npm:pi-minimodel-ocr
 
 ## Usage
 
-### As a tool (LLM-invoked)
+### LLM-invoked (automatic)
 
-The extension registers a `glm_ocr` tool that the agent can call automatically. Just ask pi:
-
-```
-> What's the formula in this screenshot?
-(attach image or mention path)
-
-# The model will call glm_ocr with task="formula" and read the LaTeX
-```
+The extension registers a `glm_ocr` tool. The agent invokes it automatically when it needs to read an image or PDF. Just ask:
 
 ```
-> Extract all text from paper.pdf
-# Model calls glm_ocr with task="auto" and gets back Markdown + LaTeX
+> What formula is written in this screenshot?
 ```
 
-### As a command (user-invoked)
+The model calls `glm_ocr` with `task="formula"` and gets back LaTeX. Works the same way for text, tables, figures, or full documents.
 
-```bash
-/glm-ocr ./screenshot.png formula
-/glm-ocr ./screenshot.png auto glm-ocr:q8_0
-/glm-ocr ./document.pdf auto
-/glm-ocr ./table.png table
-/glm-ocr ./diagram.png figure
-/glm-ocr ./page.jpg text
+### Command-line (manual)
+
 ```
+/glm-ocr <file> [task] [model]
+```
+
+| Example | Result |
+|---|---|
+| `/glm-ocr ./scan.png` | Auto-detect all content |
+| `/glm-ocr ./equation.jpg formula` | LaTeX formula output |
+| `/glm-ocr ./receipt.pdf text` | Text-only extraction |
+| `/glm-ocr ./table.png table` | Markdown table |
+| `/glm-ocr ./paper.pdf auto llama3.2-vision` | Use a different model |
 
 ### Tasks
 
-| Task | Prompt | Output |
-|------|--------|--------|
-| `text` | Text Recognition | Markdown |
-| `formula` | Formula Recognition | LaTeX |
-| `table` | Table Recognition | Markdown tables |
-| `figure` | Figure Recognition | Description |
-| `auto` | Full document OCR | Markdown + LaTeX (mixed) |
+| Task | Description | Output format |
+|---|---|---|
+| `auto` | Full document OCR (default) | Markdown + LaTeX mixed |
+| `text` | Plain text recognition | Markdown |
+| `formula` | Math formula recognition | LaTeX |
+| `table` | Table structure recognition | Markdown tables |
+| `figure` | Figure / diagram description | Natural language |
+
+## Supported Models
+
+Defaults to **`glm-ocr`** (Zhipu AI, 0.9B, 94.62 OmniDocBench) — the best open-source small OCR model. Works with any Ollama vision model:
+
+```bash
+# Smaller quantized variant (~1.6 GB)
+/glm-ocr ./img.png auto glm-ocr:q8_0
+
+# Or any vision model you have pulled
+/glm-ocr ./doc.pdf auto llama3.2-vision
+/glm-ocr ./chart.png figure minicpm-v
+```
+
+Set a custom default via environment variable:
+
+```bash
+export GLM_OCR_MODEL="glm-ocr:q8_0"
+```
+
+## PDF Support
+
+| Platform | Single-page | Multi-page |
+|---|---|---|
+| **macOS** | `sips` (built-in, zero-deps) | `brew install poppler` |
+| **Linux / WSL** | `pdftoppm` (poppler-utils) | `pdftoppm` (poppler-utils) |
+
+The extension auto-detects multi-page PDFs and shows install instructions if the required tools are missing — it won't silently drop pages.
 
 ## Configuration
 
-### Model Selection
-
-You can override the model per-call:
+### Environment variables
 
 ```bash
-# Via command - 3rd argument is the model
-/glm-ocr ./image.png formula glm-ocr:q8_0
-/glm-ocr ./paper.pdf auto llama3.2-vision
-
-# Via LLM - the agent can specify the model parameter
-# Example: "use glm_ocr with model='minicpm-v' to read this image"
+export OLLAMA_HOST="http://localhost:11434"   # default
+export GLM_OCR_MODEL="glm-ocr"                 # default model
 ```
 
-### Environment Variables
-
-```bash
-export OLLAMA_HOST="http://localhost:11434"  # default
-export GLM_OCR_MODEL="glm-ocr"                # default model
-```
-
-Or in `~/.pi/agent/settings.json`:
+### settings.json
 
 ```json
 {
@@ -129,18 +134,20 @@ Or in `~/.pi/agent/settings.json`:
 ## How It Works
 
 ```
-┌──────────────┐     ┌─────────────┐     ┌─────────────────┐
-│  pi (DeepSeek)│────▶│  glm_ocr    │────▶│  Ollama Server  │
-│  (no vision)  │     │  (extension) │     │  (GLM-OCR 0.9B) │
-└──────────────┘     └─────────────┘     └─────────────────┘
-       │                    │                      │
-       │   "read this pic"  │   POST /api/generate  │
-       │───────────────────▶│──────────────────────▶│
-       │                    │   base64 image + task  │
-       │                    │◀──────────────────────│
-       │   LaTeX formula    │   OCR text response   │
-       │◀───────────────────│                       │
+┌──────────────────┐     ┌──────────────────┐     ┌─────────────────────┐
+│  pi (DeepSeek)   │────▶│  glm_ocr (tool)  │────▶│  Ollama Server      │
+│  (no vision)     │     │  pi extension    │     │  (any vision model) │
+└──────────────────┘     └──────────────────┘     └─────────────────────┘
+        │                         │                           │
+        │  "read this image"      │  POST /api/generate       │
+        │────────────────────────▶│  base64 image + prompt    │
+        │                         │──────────────────────────▶│
+        │                         │  OCR text response        │
+        │  LaTeX / Markdown       │◀──────────────────────────│
+        │◀────────────────────────│                           │
 ```
+
+For PDFs, the extension converts each page to PNG using `sips` (macOS) or `pdftoppm` (Linux) before sending to Ollama.
 
 ## License
 
