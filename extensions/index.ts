@@ -206,13 +206,40 @@ const glmOcrTool = defineTool({
 
 				// Count pages and convert
 				const pageCount = await getPdfPageCount(filePath);
+
+				// Proactive check: multi-page PDF on macOS without extra tools
+				if (pageCount > 1 && process.platform === "darwin") {
+					const hasMultiPage = await checkMacMultiPageSupport();
+					if (!hasMultiPage) {
+						onUpdate?.({
+							content: [{
+								type: "text",
+								text:
+									`⚠️ Multi-page PDF detected (${pageCount} pages) but no multi-page converter found.\n` +
+									`Only page 1 will be processed with built-in sips.\n` +
+									`\nTo OCR all pages, install one of:\n` +
+									`  • brew install poppler  (recommended)\n` +
+									`  • pip install pyobjc-framework-Quartz`,
+							}],
+							details: {},
+						});
+					}
+				}
+
 				const pageResults: string[] = [];
 
 				for (let i = 0; i < pageCount; i++) {
 					if (signal?.aborted) throw new Error("Aborted");
 
 					const pageOut = join(tmpDir, `page_${i + 1}.png`);
-					await convertPdfPage(filePath, i, pageOut);
+
+					try {
+						await convertPdfPage(filePath, i, pageOut);
+					} catch (e: any) {
+						// Multi-page without tools → skip this page with a note
+						pageResults.push(`## Page ${i + 1}\n\n> ⚠️ Skipped: ${e.message}`);
+						continue;
+					}
 
 					onUpdate?.({
 						content: [
@@ -367,6 +394,32 @@ async function convertPdfPage(pdfPath: string, pageIndex: number, outPath: strin
 			outPath.replace(/\.png$/, ""),
 		]);
 	}
+}
+
+/** Check if macOS has multi-page PDF support (pdftoppm or pyobjc). Cached. */
+let macMultiPageCheck: { done: boolean; available: boolean } | null = null;
+
+async function checkMacMultiPageSupport(): Promise<boolean> {
+	if (macMultiPageCheck?.done) return macMultiPageCheck.available;
+
+	// Try pdftoppm (Homebrew)
+	try {
+		await execCmdCapture("pdftoppm", ["-v"]);
+		macMultiPageCheck = { done: true, available: true };
+		return true;
+	} catch {}
+
+	// Try python3 + Quartz
+	try {
+		const py = await execCmdCapture("python3", ["-c", "from Quartz import CGPDFDocumentCreateWithURL; print('OK')"]);
+		if (py.includes("OK")) {
+			macMultiPageCheck = { done: true, available: true };
+			return true;
+		}
+	} catch {}
+
+	macMultiPageCheck = { done: true, available: false };
+	return false;
 }
 
 /** macOS PDF page → PNG: tries multiple methods in priority order */
@@ -530,6 +583,18 @@ export default function glmOcrExtension(pi: ExtensionAPI) {
 			"glm-ocr",
 			`GLM-OCR: ${config.model} @ ${config.ollamaHost}`,
 		);
+
+		// Proactive check: warn if macOS multi-page PDF support is missing
+		if (process.platform === "darwin") {
+			checkMacMultiPageSupport().then((available) => {
+				if (!available) {
+					ctx.ui.notify(
+						"💡 Multi-page PDF OCR needs pdftoppm (brew install poppler) or pyobjc. Page 1 uses built-in sips.",
+						"warning",
+					);
+				}
+			});
+		}
 	});
 
 	// Log registration
