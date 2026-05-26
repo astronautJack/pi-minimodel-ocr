@@ -64,18 +64,25 @@ function isImage(filePath: string): boolean {
 	return [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif"].includes(ext);
 }
 
-// Note: execCmd is unused; kept for reference. Use execCmdCapture for all cases.
-
-/** Execute a command and capture stdout */
+/** Execute a command and capture stdout. Stderr is captured in the error message. */
 function execCmdCapture(cmd: string, args: string[]): Promise<string> {
 	return new Promise((resolve, reject) => {
 		const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-		const chunks: Buffer[] = [];
-		child.stdout.on("data", (d) => chunks.push(d));
-		child.on("error", reject);
+		const outChunks: Buffer[] = [];
+		const errChunks: Buffer[] = [];
+		child.stdout.on("data", (d) => outChunks.push(d));
+		child.stderr.on("data", (d) => errChunks.push(d));
+		child.on("error", (e) => {
+			// ENOENT = command not found
+			reject(new Error(`${cmd}: ${(e as any).code === "ENOENT" ? "command not found" : e.message}`));
+		});
 		child.on("close", (code) => {
-			if (code === 0) resolve(Buffer.concat(chunks).toString("utf8"));
-			else reject(new Error(`${cmd} exited with code ${code}: ${Buffer.concat(chunks).toString("utf8")}`));
+			const stderr = Buffer.concat(errChunks).toString("utf8").trim();
+			if (code === 0) {
+				resolve(Buffer.concat(outChunks).toString("utf8"));
+			} else {
+				reject(new Error(`${cmd} exited with code ${code}${stderr ? ": " + stderr : ""}`));
+			}
 		});
 	});
 }
@@ -321,6 +328,7 @@ async function callGlmOcr(
 
 async function getPdfPageCount(pdfPath: string): Promise<number> {
 	if (process.platform === "darwin") {
+		// macOS: mdls (built-in)
 		try {
 			const out = await execCmdCapture("mdls", ["-name", "kMDItemNumberOfPages", "-raw", pdfPath]);
 			const n = parseInt(out.trim(), 10);
@@ -328,49 +336,106 @@ async function getPdfPageCount(pdfPath: string): Promise<number> {
 		} catch { /* fall through */ }
 	}
 
-	// Generic fallback using python with PyPDF2 or pdfplumber
-	try {
-		const py = await execCmdCapture("python3", [
-			"-c",
-			`import sys
-try:
-    from PyPDF2 import PdfReader
-    r = PdfReader("${pdfPath.replace(/"/g, '\\"')}")
-    print(len(r.pages))
-except ImportError:
-    try:
-        import pdfplumber
-        with pdfplumber.open("${pdfPath.replace(/"/g, '\\"')}") as pdf:
-            print(len(pdf.pages))
-    except ImportError:
-        print(1)`,
+	// Linux: pdfinfo (part of poppler-utils)
+	if (process.platform === "linux") {
+		try {
+			const out = await execCmdCapture("pdfinfo", [pdfPath]);
+			const m = out.match(/Pages:\s+(\d+)/);
+			if (m) return parseInt(m[1], 10) || 1;
+		} catch { /* fall through */ }
+	}
+
+	return 1;
+}
+
+/**
+ * Convert a single PDF page to PNG.
+ * - macOS: tries sips (built-in, always available), pdftoppm, then python Quartz
+ * - Linux: uses pdftoppm (poppler-utils)
+ */
+async function convertPdfPage(pdfPath: string, pageIndex: number, outPath: string): Promise<void> {
+	if (process.platform === "darwin") {
+		await convertPdfPageMac(pdfPath, pageIndex, outPath);
+	} else {
+		// Linux / WSL: use pdftoppm
+		await execCmdCapture("pdftoppm", [
+			"-png", "-r", "200",
+			"-f", String(pageIndex + 1),
+			"-l", String(pageIndex + 1),
+			"-singlefile",
+			pdfPath,
+			outPath.replace(/\.png$/, ""),
 		]);
-		return parseInt(py.trim(), 10) || 1;
-	} catch {
-		return 1;
 	}
 }
 
-async function convertPdfPage(pdfPath: string, pageIndex: number, outPath: string): Promise<void> {
-	if (process.platform === "darwin") {
-		// Use python3 + Quartz (CoreGraphics) for macOS
-		const script = `
-import sys
-from Quartz import (
-    CGPDFDocumentCreateWithURL,
-    CGPDFPageGetBoxRect,
-    kCGPDFMediaBox,
-    CGColorSpaceCreateDeviceRGB,
-    CGBitmapContextCreate,
-    CGBitmapContextCreateImage,
-    CGContextDrawPDFPage,
-    CGImageDestinationCreateWithURL,
-    CGImageDestinationAddImage,
-    CGImageDestinationFinalize,
-)
-from Foundation import NSURL
+/** macOS PDF page → PNG: tries multiple methods in priority order */
+async function convertPdfPageMac(pdfPath: string, pageIndex: number, outPath: string): Promise<void> {
+	// Method 1: sips (built-in, always available, supports only page 1)
+	if (pageIndex === 0) {
+		try {
+			await execCmdCapture("sips", [
+				"-s", "format", "png",
+				pdfPath,
+				"--out", outPath,
+			]);
+			return;
+		} catch (e: any) {
+			throw new Error(`sips PDF conversion failed: ${e.message}`);
+		}
+	}
 
-pdf_url = NSURL.fileURLWithPath_("${pdfPath.replace(/"/g, '\\"')}")
+	// Page > 1: try pdftoppm (Homebrew), then python Quartz
+	try {
+		await execCmdCapture("pdftoppm", [
+			"-png", "-r", "200",
+			"-f", String(pageIndex + 1),
+			"-l", String(pageIndex + 1),
+			"-singlefile",
+			pdfPath,
+			outPath.replace(/\.png$/, ""),
+		]);
+		return;
+	} catch { /* try next method */ }
+
+	// Try python3 + Quartz (needs pyobjc-framework-Quartz installed)
+	try {
+		await convertPdfPageQuartz(pdfPath, pageIndex, outPath);
+		return;
+	} catch { /* fall through to error */ }
+
+	throw new Error(
+		`Multi-page PDF requires pdftoppm (brew install poppler) or pyobjc (pip install pyobjc-framework-Quartz). ` +
+		`Only page 1 was processed with sips.`,
+	);
+}
+
+/** Python3 + Quartz (CoreGraphics) fallback for multi-page PDFs */
+async function convertPdfPageQuartz(pdfPath: string, pageIndex: number, outPath: string): Promise<void> {
+	const escapedPath = pdfPath.replace(/"/g, '\\"');
+	const escapedOut = outPath.replace(/"/g, '\\"');
+
+	const script = `
+import sys
+try:
+    from Quartz import (
+        CGPDFDocumentCreateWithURL,
+        CGPDFPageGetBoxRect,
+        kCGPDFMediaBox,
+        CGColorSpaceCreateDeviceRGB,
+        CGBitmapContextCreate,
+        CGBitmapContextCreateImage,
+        CGContextDrawPDFPage,
+        CGImageDestinationCreateWithURL,
+        CGImageDestinationAddImage,
+        CGImageDestinationFinalize,
+    )
+    from Foundation import NSURL
+except ImportError:
+    print("QUARTZ_MISSING")
+    sys.exit(0)
+
+pdf_url = NSURL.fileURLWithPath_("${escapedPath}")
 doc = CGPDFDocumentCreateWithURL(pdf_url)
 if not doc:
     sys.exit(1)
@@ -387,34 +452,25 @@ height = int(rect.size.height * scale)
 cs = CGColorSpaceCreateDeviceRGB()
 ctx = CGBitmapContextCreate(
     None, width, height, 8, width * 4,
-    cs, 0x2002  # kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little
+    cs, 0x2002
 )
 ctx.scaleCTM(scale, scale)
 CGContextDrawPDFPage(ctx, page)
-
 cg_img = CGBitmapContextCreateImage(ctx)
 
-out_url = NSURL.fileURLWithPath_("${outPath.replace(/"/g, '\\"')}")
+out_url = NSURL.fileURLWithPath_("${escapedOut}")
 dest = CGImageDestinationCreateWithURL(out_url, "public.png", 1, None)
 if dest:
     CGImageDestinationAddImage(dest, cg_img, None)
     CGImageDestinationFinalize(dest)
+    print("OK")
 `;
-		await execCmdCapture("python3", ["-c", script]);
-	} else {
-		// Linux: pdftoppm - single page
-		await execCmdCapture("pdftoppm", [
-			"-png",
-			"-r",
-			"200",
-			"-f",
-			String(pageIndex + 1),
-			"-l",
-			String(pageIndex + 1),
-			"-singlefile",
-			pdfPath,
-			outPath.replace(/\.png$/, ""),
-		]);
+	const py = await execCmdCapture("python3", ["-c", script]);
+	if (py.includes("QUARTZ_MISSING")) {
+		throw new Error("pyobjc-framework-Quartz not installed");
+	}
+	if (!py.includes("OK")) {
+		throw new Error("Python Quartz conversion returned no output");
 	}
 }
 

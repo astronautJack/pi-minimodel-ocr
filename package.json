@@ -1,6 +1,6 @@
 {
   "name": "pi-glm-ocr",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pi extension: Local OCR via Ollama GLM-OCR (0.9B) — convert images and PDFs to Markdown / LaTeX with high math formula accuracy. Bridges the multimodal gap for non-vision LLMs like DeepSeek.",
   "keywords": [
     "pi-package",

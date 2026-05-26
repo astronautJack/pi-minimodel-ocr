@@ -31,11 +31,16 @@
    ```
    Model size: ~2.2 GB (bf16) or ~1.6 GB (q8_0 variant)
 
-3. **For PDF support on Linux:**
+3. **For PDF support on Linux/WSL:**
    ```bash
    sudo apt install poppler-utils
    ```
-   macOS uses built-in CoreGraphics — no extra dependencies needed.
+   macOS uses built-in `sips` — no extra dependencies needed for single-page PDFs.
+   For multi-page PDFs on macOS, install either:
+   ```bash
+   brew install poppler          # recommended
+   pip install pyobjc-framework-Quartz  # alternative
+   ```
 
 ## Install
 
