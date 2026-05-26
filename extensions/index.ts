@@ -567,9 +567,9 @@ export default function ocrExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// Register /ocr-model command with interactive picker + custom input
+	// Register /ocr-model command — recommendations + type-to-change
 	pi.registerCommand("ocr-model", {
-		description: "View or change the default OCR model (persists across sessions)",
+		description: "View or change the OCR model (persists across sessions). Type a name or use /ocr-model <name>",
 		handler: async (args, ctx) => {
 			const trimmed = (args || "").trim();
 			const config = getConfig(ctx);
@@ -580,47 +580,22 @@ export default function ocrExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			// Build picker items
-			const items: string[] = [];
-
-			items.push(`Current: ${config.model}`);
-			items.push("");
-
-			items.push("── Recommended ──");
-			for (const r of RECOMMENDED) {
-				items.push(`${r.model}  → ${r.hint}`);
-			}
-
+			// Show recommendations + recents
+			ctx.ui.notify(`Current: ${config.model} | Recommended: ${RECOMMENDED.map(r => r.model).join(", ")}`, "info");
 			if (recentModels.length > 0) {
-				items.push("");
-				items.push("── Recent ──");
-				const deduped = recentModels.filter(
-					(m) => !RECOMMENDED.some((r) => r.model === m),
-				);
-				for (const m of deduped.slice(0, 5)) {
-					items.push(m);
-				}
+				const deduped = recentModels
+					.filter((m) => !RECOMMENDED.some((r) => r.model === m))
+					.slice(0, 3);
+				if (deduped.length > 0) ctx.ui.notify(`Recent: ${deduped.join(", ")}`, "info");
 			}
 
-			items.push("");
-			items.push("── Custom… (type any model name) ──");
-
-			const choice = await ctx.ui.select("OCR Model — Enter to pick, Esc to cancel", items);
-			if (!choice || choice.startsWith("──") || choice.startsWith("Current") || choice === "") {
-				return;
-			}
-
-			// Custom input
-			if (choice.includes("Custom")) {
-				const custom = await ctx.ui.input("Enter model name (e.g. deepseek-ocr)");
-				if (!custom?.trim()) return;
-				await applyModel(custom.trim(), config, ctx);
-				return;
-			}
-
-			// Picked from list — extract model name
-			const newModel = choice.split(/\s+→/)[0].trim();
-			await applyModel(newModel, config, ctx);
+			// Text input to change (pre-filled with current model)
+			const newModel = await ctx.ui.input(
+				"Enter OCR model name (or press Enter to keep current)",
+				config.model,
+			);
+			if (!newModel?.trim() || newModel.trim() === config.model) return;
+			await applyModel(newModel.trim(), config, ctx);
 		},
 	});
 
