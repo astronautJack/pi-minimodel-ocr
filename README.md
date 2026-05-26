@@ -2,7 +2,7 @@
 
 Local OCR for [Pi Coding Agent](https://pi.dev) — extract text, LaTeX math formulas, and tables from images and PDFs using small vision models via [Ollama](https://ollama.com).
 
-> Bridges the multimodal gap for non-vision LLMs like **DeepSeek**. When your model can't see images, `glm_ocr` acts as its eyes — with state-of-the-art formula recognition outputting LaTeX.
+> Bridges the multimodal gap for non-vision LLMs like **DeepSeek**. When your model can't see images, `minimodel_ocr` acts as its eyes — with state-of-the-art formula recognition outputting LaTeX.
 
 ## Features
 
@@ -51,27 +51,27 @@ pi -e npm:pi-minimodel-ocr
 
 ### LLM-invoked (automatic)
 
-The extension registers a `glm_ocr` tool. The agent invokes it automatically when it needs to read an image or PDF. Just ask:
+The extension registers a `minimodel_ocr` tool. The agent invokes it automatically when it needs to read an image or PDF. Just ask:
 
 ```
 > What formula is written in this screenshot?
 ```
 
-The model calls `glm_ocr` with `task="formula"` and gets back LaTeX. Works the same way for text, tables, figures, or full documents.
+The model calls `minimodel_ocr` with `task="formula"` and gets back LaTeX. Works the same way for text, tables, figures, or full documents.
 
 ### Command-line (manual)
 
 ```
-/glm-ocr <file> [task] [model]
+/ocr <file> [task] [model]
 ```
 
 | Example | Result |
 |---|---|
-| `/glm-ocr ./scan.png` | Auto-detect all content |
-| `/glm-ocr ./equation.jpg formula` | LaTeX formula output |
-| `/glm-ocr ./receipt.pdf text` | Text-only extraction |
-| `/glm-ocr ./table.png table` | Markdown table |
-| `/glm-ocr ./paper.pdf auto llama3.2-vision` | Use a different model |
+| `/ocr ./scan.png` | Auto-detect all content |
+| `/ocr ./equation.jpg formula` | LaTeX formula output |
+| `/ocr ./receipt.pdf text` | Text-only extraction |
+| `/ocr ./table.png table` | Markdown table |
+| `/ocr ./paper.pdf auto llama3.2-vision` | Use a different model |
 
 ### Tasks
 
@@ -89,17 +89,17 @@ Defaults to **`glm-ocr`** (Zhipu AI, 0.9B, 94.62 OmniDocBench) — the best open
 
 ```bash
 # Smaller quantized variant (~1.6 GB)
-/glm-ocr ./img.png auto glm-ocr:q8_0
+/ocr ./img.png auto glm-ocr:q8_0
 
 # Or any vision model you have pulled
-/glm-ocr ./doc.pdf auto llama3.2-vision
-/glm-ocr ./chart.png figure minicpm-v
+/ocr ./doc.pdf auto llama3.2-vision
+/ocr ./chart.png figure minicpm-v
 ```
 
 Set a custom default via environment variable:
 
 ```bash
-export GLM_OCR_MODEL="glm-ocr:q8_0"
+export OCR_MODEL="glm-ocr:q8_0"
 ```
 
 ## PDF Support
@@ -117,14 +117,14 @@ The extension auto-detects multi-page PDFs and shows install instructions if the
 
 ```bash
 export OLLAMA_HOST="http://localhost:11434"   # default
-export GLM_OCR_MODEL="glm-ocr"                 # default model
+export OCR_MODEL="glm-ocr"                    # default model
 ```
 
 ### settings.json
 
 ```json
 {
-  "glmOcr": {
+  "minimodelOcr": {
     "ollamaHost": "http://localhost:11434",
     "model": "glm-ocr"
   }
@@ -135,7 +135,7 @@ export GLM_OCR_MODEL="glm-ocr"                 # default model
 
 ```
 ┌──────────────────┐     ┌──────────────────┐     ┌─────────────────────┐
-│  pi (DeepSeek)   │────▶│  glm_ocr (tool)  │────▶│  Ollama Server      │
+│  pi (DeepSeek)   │────▶│  minimodel_ocr   │────▶│  Ollama Server      │
 │  (no vision)     │     │  pi extension    │     │  (any vision model) │
 └──────────────────┘     └──────────────────┘     └─────────────────────┘
         │                         │                           │

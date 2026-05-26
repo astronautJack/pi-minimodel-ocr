@@ -1,8 +1,8 @@
 /**
  * pi-minimodel-ocr — Local OCR via Ollama for Pi Coding Agent
  *
- * Registers a `glm_ocr` tool that the LLM can call to read images and PDFs
- * using the locally running GLM-OCR model via Ollama (0.9B).
+ * Registers a `minimodel_ocr` tool that the LLM can call to read images and PDFs
+ * using any locally running Ollama vision model (default: glm-ocr 0.9B).
  *
  * Supported tasks:
  *   - text    → Markdown text recognition
@@ -13,8 +13,9 @@
  *
  * Prerequisites:
  *   1. Install Ollama: https://ollama.com/download
- *   2. Pull the model:  ollama pull glm-ocr
- *   3. For PDF support on macOS: built-in sips
+ *   2. Pull a model:  ollama pull glm-ocr
+ *   3. For PDF support on macOS: built-in sips (page 1)
+ *      For multi-page macOS: pip install pyobjc-framework-Quartz
  *      For Linux: apt install poppler-utils (pdftoppm)
  *
  * Install:
@@ -23,7 +24,7 @@
  *   pi -e ./extensions/index.ts
  *
  * Configuration (optional, in settings.json):
- *   { "glmOcr": { "ollamaHost": "http://localhost:11434", "model": "glm-ocr" } }
+ *   { "minimodelOcr": { "ollamaHost": "http://localhost:11434", "model": "glm-ocr" } }
  */
 
 import { Type } from "@earendil-works/pi-ai";
@@ -38,7 +39,7 @@ import { tmpdir } from "node:os";
 const TASKS = ["text", "formula", "table", "figure", "auto"] as const;
 type Task = (typeof TASKS)[number];
 
-interface GlmOcrConfig {
+interface OcrConfig {
 	ollamaHost: string;
 	model: string;
 }
@@ -49,7 +50,6 @@ interface GlmOcrConfig {
 function isPdf(filePath: string): boolean {
 	const ext = extname(filePath).toLowerCase();
 	if (ext === ".pdf") return true;
-	// Check magic bytes
 	try {
 		const buf = readFileSync(filePath).subarray(0, 4);
 		return buf.toString() === "%PDF";
@@ -73,7 +73,6 @@ function execCmdCapture(cmd: string, args: string[]): Promise<string> {
 		child.stdout.on("data", (d) => outChunks.push(d));
 		child.stderr.on("data", (d) => errChunks.push(d));
 		child.on("error", (e) => {
-			// ENOENT = command not found
 			reject(new Error(`${cmd}: ${(e as any).code === "ENOENT" ? "command not found" : e.message}`));
 		});
 		child.on("close", (code) => {
@@ -98,7 +97,7 @@ function cleanupDir(dir: string) {
 	}
 }
 
-/** Build the prompt string for GLM-OCR task */
+/** Build the prompt string for OCR task */
 function buildPrompt(task: Task): string {
 	switch (task) {
 		case "text":
@@ -116,7 +115,7 @@ function buildPrompt(task: Task): string {
 
 // ── Tool Definition ──────────────────────────────────────────────────────────
 
-const glmOcrSchema = Type.Object({
+const ocrSchema = Type.Object({
 	path: Type.String({
 		description:
 			"Absolute or relative path to the image or PDF file to OCR. Supported formats: PNG, JPG, GIF, WEBP, BMP, TIFF, PDF.",
@@ -135,21 +134,21 @@ const glmOcrSchema = Type.Object({
 	),
 });
 
-const glmOcrTool = defineTool({
-	name: "glm_ocr",
-	label: "GLM OCR",
+const ocrTool = defineTool({
+	name: "minimodel_ocr",
+	label: "Minimodel OCR",
 	description:
-		"Extract text, math formulas (LaTeX), and tables from images or PDFs using local GLM-OCR via Ollama. " +
+		"Extract text, math formulas (LaTeX), and tables from images or PDFs using local Ollama vision models. " +
 		"Use this when you need to read text from an image or PDF, especially mathematical formulas that need LaTeX output. " +
 		"This is the tool to use when working with non-vision LLMs like DeepSeek that cannot process images directly.",
 	promptSnippet:
-		"Extract text/formulas/tables from images and PDFs using local GLM-OCR (Ollama)",
+		"Extract text/formulas/tables from images and PDFs using local Ollama OCR",
 	promptGuidelines: [
-		"When the user asks about the content of an image or PDF, use glm_ocr to extract the text first.",
-		"For mathematical documents, use glm_ocr with task='formula' or task='auto' to get LaTeX output.",
-		"Use glm_ocr with task='auto' for general document OCR to extract all text, formulas, tables, and figures.",
+		"When the user asks about the content of an image or PDF, use minimodel_ocr to extract the text first.",
+		"For mathematical documents, use minimodel_ocr with task='formula' or task='auto' to get LaTeX output.",
+		"Use minimodel_ocr with task='auto' for general document OCR to extract all text, formulas, tables, and figures.",
 	],
-	parameters: glmOcrSchema,
+	parameters: ocrSchema,
 	async execute(_toolCallId, params, signal, onUpdate, ctx) {
 		const { path: filePath, task = "auto", model: modelOverride } = params as {
 			path: string;
@@ -202,7 +201,7 @@ const glmOcrTool = defineTool({
 					details: {},
 				});
 
-				tmpDir = mkdtempSync(join(tmpdir(), "pi-glm-ocr-"));
+				tmpDir = mkdtempSync(join(tmpdir(), "pi-ocr-"));
 
 				// Count pages and convert
 				const pageCount = await getPdfPageCount(filePath);
@@ -248,14 +247,14 @@ const glmOcrTool = defineTool({
 						details: {},
 					});
 
-					const pageText = await callGlmOcr(config, pageOut, resolvedTask, signal, resolvedModel);
+					const pageText = await callOcr(config, pageOut, resolvedTask, signal, resolvedModel);
 					pageResults.push(`## Page ${i + 1}\n\n${pageText}`);
 				}
 
 				resultText = pageResults.join("\n\n");
 			} else {
 				// ── Image: process directly ───────────────────────────────
-				resultText = await callGlmOcr(config, filePath, resolvedTask, signal, resolvedModel);
+				resultText = await callOcr(config, filePath, resolvedTask, signal, resolvedModel);
 			}
 
 			// Build summary
@@ -265,7 +264,7 @@ const glmOcrTool = defineTool({
 				content: [
 					{
 						type: "text",
-						text: `## GLM-OCR Result (${resolvedTask})\n\n**File:** \`${basename(filePath)}\`\n\n${preview}`,
+						text: `## OCR Result (${resolvedTask})\n\n**File:** \`${basename(filePath)}\`\n\n${preview}`,
 					},
 				],
 				details: {
@@ -292,14 +291,13 @@ const glmOcrTool = defineTool({
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
-let cachedConfig: GlmOcrConfig | null = null;
+let cachedConfig: OcrConfig | null = null;
 
-function getConfig(_ctx?: ExtensionContext): GlmOcrConfig {
+function getConfig(_ctx?: ExtensionContext): OcrConfig {
 	if (cachedConfig) return cachedConfig;
 
-	// Try to read from pi settings or environment variables
 	const envHost = process.env.OLLAMA_HOST || "http://localhost:11434";
-	const envModel = process.env.GLM_OCR_MODEL || "glm-ocr";
+	const envModel = process.env.OCR_MODEL || "glm-ocr";
 
 	cachedConfig = {
 		ollamaHost: envHost,
@@ -310,8 +308,8 @@ function getConfig(_ctx?: ExtensionContext): GlmOcrConfig {
 
 // ── Ollama API ──────────────────────────────────────────────────────────────
 
-async function callGlmOcr(
-	config: GlmOcrConfig,
+async function callOcr(
+	config: OcrConfig,
 	imagePath: string,
 	task: Task,
 	signal?: AbortSignal,
@@ -345,7 +343,7 @@ async function callGlmOcr(
 	const data = (await response.json()) as { response?: string; error?: string };
 
 	if (data.error) {
-		throw new Error(`GLM-OCR error: ${data.error}`);
+		throw new Error(`OCR error: ${data.error}`);
 	}
 
 	return data.response?.trim() || "";
@@ -355,7 +353,6 @@ async function callGlmOcr(
 
 async function getPdfPageCount(pdfPath: string): Promise<number> {
 	if (process.platform === "darwin") {
-		// macOS: mdls (built-in)
 		try {
 			const out = await execCmdCapture("mdls", ["-name", "kMDItemNumberOfPages", "-raw", pdfPath]);
 			const n = parseInt(out.trim(), 10);
@@ -363,7 +360,6 @@ async function getPdfPageCount(pdfPath: string): Promise<number> {
 		} catch { /* fall through */ }
 	}
 
-	// Linux: pdfinfo (part of poppler-utils)
 	if (process.platform === "linux") {
 		try {
 			const out = await execCmdCapture("pdfinfo", [pdfPath]);
@@ -384,7 +380,6 @@ async function convertPdfPage(pdfPath: string, pageIndex: number, outPath: strin
 	if (process.platform === "darwin") {
 		await convertPdfPageMac(pdfPath, pageIndex, outPath);
 	} else {
-		// Linux / WSL: use pdftoppm
 		await execCmdCapture("pdftoppm", [
 			"-png", "-r", "200",
 			"-f", String(pageIndex + 1),
@@ -402,7 +397,6 @@ let macMultiPageCheck: { done: boolean; available: boolean } | null = null;
 async function checkMacMultiPageSupport(): Promise<boolean> {
 	if (macMultiPageCheck?.done) return macMultiPageCheck.available;
 
-	// Try pyobjc-framework-Quartz first (light, pip install, ~2MB)
 	try {
 		const py = await execCmdCapture("python3", ["-c", "from Quartz import CGPDFDocumentCreateWithURL; print('OK')"]);
 		if (py.includes("OK")) {
@@ -411,7 +405,6 @@ async function checkMacMultiPageSupport(): Promise<boolean> {
 		}
 	} catch {}
 
-	// Try pdftoppm (Homebrew, 34MB)
 	try {
 		await execCmdCapture("pdftoppm", ["-v"]);
 		macMultiPageCheck = { done: true, available: true };
@@ -424,7 +417,6 @@ async function checkMacMultiPageSupport(): Promise<boolean> {
 
 /** macOS PDF page → PNG: tries multiple methods in priority order */
 async function convertPdfPageMac(pdfPath: string, pageIndex: number, outPath: string): Promise<void> {
-	// Method 1: sips (built-in, always available, supports only page 1)
 	if (pageIndex === 0) {
 		try {
 			await execCmdCapture("sips", [
@@ -528,17 +520,17 @@ if dest:
 
 // ── Extension Entry ─────────────────────────────────────────────────────────
 
-export default function glmOcrExtension(pi: ExtensionAPI) {
-	// Register the glm_ocr tool
-	pi.registerTool(glmOcrTool);
+export default function ocrExtension(pi: ExtensionAPI) {
+	// Register the minimodel_ocr tool
+	pi.registerTool(ocrTool);
 
-	// Register /glm-ocr command for user convenience
-	pi.registerCommand("glm-ocr", {
-		description: "OCR an image or PDF file using local GLM-OCR",
+	// Register /ocr command for user convenience
+	pi.registerCommand("ocr", {
+		description: "OCR an image or PDF file using a local Ollama vision model",
 		handler: async (args, ctx) => {
 			const trimmed = (args || "").trim();
 			if (!trimmed) {
-				ctx.ui.notify("Usage: /glm-ocr <file-path> [task] [model]", "info");
+				ctx.ui.notify("Usage: /ocr <file-path> [task] [model]", "info");
 				ctx.ui.notify("Tasks: text, formula, table, figure, auto (default)", "info");
 				ctx.ui.notify("Model: any Ollama vision model (default: glm-ocr)", "info");
 				return;
@@ -555,7 +547,7 @@ export default function glmOcrExtension(pi: ExtensionAPI) {
 			}
 
 			// Call the tool directly
-			const result = await glmOcrTool.execute("", { path: filePath, task, model }, undefined as any, undefined, ctx);
+			const result = await ocrTool.execute("", { path: filePath, task, model }, undefined as any, undefined, ctx);
 
 			if (result.isError) {
 				const msg =
@@ -579,8 +571,8 @@ export default function glmOcrExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		const config = getConfig(ctx);
 		ctx.ui.setStatus(
-			"glm-ocr",
-			`GLM-OCR: ${config.model} @ ${config.ollamaHost}`,
+			"minimodel-ocr",
+			`OCR: ${config.model} @ ${config.ollamaHost}`,
 		);
 
 		// Proactive check: warn if macOS multi-page PDF support is missing
@@ -596,6 +588,5 @@ export default function glmOcrExtension(pi: ExtensionAPI) {
 		}
 	});
 
-	// Log registration
-	console.log("[pi-minimodel-ocr] Extension loaded. Tool: glm_ocr, Command: /glm-ocr");
+	console.log("[pi-minimodel-ocr] Extension loaded. Tool: minimodel_ocr, Command: /ocr");
 }
