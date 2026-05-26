@@ -214,11 +214,10 @@ const ocrTool = defineTool({
 							content: [{
 								type: "text",
 								text:
-									`⚠️ Multi-page PDF detected (${pageCount} pages) but no multi-page converter found.\n` +
+									`⚠️ Multi-page PDF detected (${pageCount} pages) but pyobjc is not installed.\n` +
 									`Only page 1 will be processed with built-in sips.\n` +
-									`\nTo OCR all pages, install one of:\n` +
-									`  • pip install pyobjc-framework-Quartz  (recommended, lightweight)\n` +
-									`  • brew install poppler`,
+									`\nTo OCR all pages:\n` +
+									`  pip install pyobjc-framework-Quartz`,
 							}],
 							details: {},
 						});
@@ -373,7 +372,7 @@ async function getPdfPageCount(pdfPath: string): Promise<number> {
 
 /**
  * Convert a single PDF page to PNG.
- * - macOS: tries sips (built-in), pyobjc (light, pip), then pdftoppm (brew)
+ * - macOS: tries sips (built-in), then pyobjc (pip install)
  * - Linux: uses pdftoppm (poppler-utils)
  */
 async function convertPdfPage(pdfPath: string, pageIndex: number, outPath: string): Promise<void> {
@@ -391,7 +390,7 @@ async function convertPdfPage(pdfPath: string, pageIndex: number, outPath: strin
 	}
 }
 
-/** Check if macOS has multi-page PDF support (pyobjc or pdftoppm). Cached. */
+/** Check if macOS has multi-page PDF support (pyobjc). Cached. */
 let macMultiPageCheck: { done: boolean; available: boolean } | null = null;
 
 async function checkMacMultiPageSupport(): Promise<boolean> {
@@ -403,12 +402,6 @@ async function checkMacMultiPageSupport(): Promise<boolean> {
 			macMultiPageCheck = { done: true, available: true };
 			return true;
 		}
-	} catch {}
-
-	try {
-		await execCmdCapture("pdftoppm", ["-v"]);
-		macMultiPageCheck = { done: true, available: true };
-		return true;
 	} catch {}
 
 	macMultiPageCheck = { done: true, available: false };
@@ -430,26 +423,14 @@ async function convertPdfPageMac(pdfPath: string, pageIndex: number, outPath: st
 		}
 	}
 
-	// Page > 1: try pyobjc (light, pip install), then pdftoppm (heavy, brew)
+	// Page > 1: use pyobjc (pip install)
 	try {
 		await convertPdfPageQuartz(pdfPath, pageIndex, outPath);
-		return;
-	} catch { /* try next method */ }
-
-	try {
-		await execCmdCapture("pdftoppm", [
-			"-png", "-r", "200",
-			"-f", String(pageIndex + 1),
-			"-l", String(pageIndex + 1),
-			"-singlefile",
-			pdfPath,
-			outPath.replace(/\.png$/, ""),
-		]);
 		return;
 	} catch { /* fall through to error */ }
 
 	throw new Error(
-		`Multi-page PDF requires pyobjc (pip install pyobjc-framework-Quartz) or pdftoppm (brew install poppler). ` +
+		`Multi-page PDF requires pyobjc (pip install pyobjc-framework-Quartz). ` +
 		`Only page 1 was processed with sips.`,
 	);
 }
@@ -580,7 +561,7 @@ export default function ocrExtension(pi: ExtensionAPI) {
 			checkMacMultiPageSupport().then((available) => {
 				if (!available) {
 					ctx.ui.notify(
-						"💡 Multi-page PDF OCR needs pyobjc (pip install pyobjc-framework-Quartz) or poppler. Page 1 uses built-in sips.",
+						"💡 Multi-page PDF OCR needs pyobjc (pip install pyobjc-framework-Quartz). Page 1 uses built-in sips.",
 						"warning",
 					);
 				}
