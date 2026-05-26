@@ -518,11 +518,10 @@ export default function ocrExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// Register /ocr-model command with persistence + autocomplete
+	// Register /ocr-model command with persistence + autocomplete + interactive picker
 	pi.registerCommand("ocr-model", {
-		description: "View or change the default OCR model (persists across sessions)",
-		getArgumentCompletions: (prefix: string) => {
-			// Build completion list: recommended first, then recents
+		description: "View or change the default OCR model (persists across sessions, Tab for autocomplete)",
+		getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
 			const all = [
 				...RECOMMENDED.map((r) => ({
 					value: r.model,
@@ -532,7 +531,6 @@ export default function ocrExtension(pi: ExtensionAPI) {
 					.filter((m) => !RECOMMENDED.some((r) => r.model === m))
 					.map((m) => ({ value: m, label: `${m} (recent)` })),
 			];
-			if (!prefix) return all.slice(0, 8);
 			const filtered = all.filter((i) => i.value.startsWith(prefix));
 			return filtered.length > 0 ? filtered.slice(0, 8) : null;
 		},
@@ -541,26 +539,50 @@ export default function ocrExtension(pi: ExtensionAPI) {
 			const config = getConfig(ctx);
 
 			if (!trimmed) {
-				// Show current + recommendations + recents
-				ctx.ui.notify(`Current: ${config.model}`, "info");
+				// Interactive picker: recommended + recents
+				const items: string[] = [];
+
+				items.push(`Current: ${config.model}`);
+				items.push("");
+
+				items.push("── Recommended ──");
+				for (const r of RECOMMENDED) {
+					items.push(`${r.model}  → ${r.hint}`);
+				}
 
 				if (recentModels.length > 0) {
-					const recents = recentModels.slice(0, 3).join(", ");
-					ctx.ui.notify(`Recent: ${recents}`, "info");
+					items.push("");
+					items.push("── Recent ──");
+					const deduped = recentModels.filter(
+						(m) => !RECOMMENDED.some((r) => r.model === m),
+					);
+					for (const m of deduped.slice(0, 5)) {
+						items.push(m);
+					}
 				}
 
-				for (const r of RECOMMENDED) {
-					ctx.ui.notify(`  ${r.model} — ${r.hint}`, "info");
+				const choice = await ctx.ui.select("OCR Model — press Enter to switch, Esc to cancel", items);
+				if (!choice || choice.startsWith("──") || choice.startsWith("Current") || choice === "") {
+					return;
 				}
 
-				ctx.ui.notify("To change: /ocr-model <name>", "info");
+				// Extract model name from selection (strip hint part)
+				const newModel = choice.split(/\s+→/)[0].trim();
+				setModel(newModel);
+
+				pi.appendEntry<PersistedState>("ocr-model-config", {
+					model: newModel,
+					recentModels,
+				});
+
+				ctx.ui.setStatus("minimodel-ocr", `OCR: ${newModel} @ ${config.ollamaHost}`);
+				ctx.ui.notify(`OCR model → ${newModel}`, "success");
 				return;
 			}
 
 			const newModel = trimmed.split(/\s+/)[0];
 			setModel(newModel);
 
-			// Persist across sessions
 			pi.appendEntry<PersistedState>("ocr-model-config", {
 				model: newModel,
 				recentModels,
