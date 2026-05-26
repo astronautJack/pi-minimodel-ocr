@@ -28,6 +28,7 @@
 
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { spawn } from "node:child_process";
 import { readFileSync, existsSync, mkdtempSync, readdirSync, unlinkSync, rmdirSync } from "node:fs";
 import { basename, extname, join } from "node:path";
@@ -293,7 +294,20 @@ const ocrTool = defineTool({
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
+/** Recommended models with brief usage hints */
+const RECOMMENDED: { model: string; hint: string }[] = [
+	{ model: "glm-ocr:q8_0", hint: "best balance — smaller, faster" },
+	{ model: "glm-ocr", hint: "default — highest accuracy" },
+	{ model: "minicpm-v", hint: "general vision tasks" },
+];
+
+interface PersistedState {
+	model: string;
+	recentModels: string[];
+}
+
 let currentModel: string | null = null;
+let recentModels: string[] = [];
 let ollamaHost: string | null = null;
 
 function getConfig(_ctx?: ExtensionContext): OcrConfig {
@@ -308,6 +322,8 @@ function getConfig(_ctx?: ExtensionContext): OcrConfig {
 
 function setModel(model: string): void {
 	currentModel = model;
+	// Move to front of recents, cap at 10, deduplicate
+	recentModels = [model, ...recentModels.filter((m) => m !== model)].slice(0, 10);
 }
 
 // ── Ollama API ──────────────────────────────────────────────────────────────
@@ -502,35 +518,73 @@ export default function ocrExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// Register /ocr-model command to view/change the default OCR model
+	// Register /ocr-model command with persistence + autocomplete
 	pi.registerCommand("ocr-model", {
-		description: "View or change the default OCR model (persists for the session)",
+		description: "View or change the default OCR model (persists across sessions)",
+		getArgumentCompletions: (prefix: string) => {
+			// Build completion list: recommended first, then recents
+			const all = [
+				...RECOMMENDED.map((r) => ({
+					value: r.model,
+					label: `${r.model} — ${r.hint}`,
+				})),
+				...recentModels
+					.filter((m) => !RECOMMENDED.some((r) => r.model === m))
+					.map((m) => ({ value: m, label: `${m} (recent)` })),
+			];
+			if (!prefix) return all.slice(0, 8);
+			const filtered = all.filter((i) => i.value.startsWith(prefix));
+			return filtered.length > 0 ? filtered.slice(0, 8) : null;
+		},
 		handler: async (args, ctx) => {
 			const trimmed = (args || "").trim();
 			const config = getConfig(ctx);
 
 			if (!trimmed) {
-				// Show current model
-				ctx.ui.notify(`Current OCR model: ${config.model}`, "info");
-				ctx.ui.notify("To change: /ocr-model <model-name>", "info");
-				ctx.ui.notify('Examples: /ocr-model glm-ocr:q8_0, /ocr-model llama3.2-vision', "info");
+				// Show current + recommendations + recents
+				ctx.ui.notify(`Current: ${config.model}`, "info");
+
+				if (recentModels.length > 0) {
+					const recents = recentModels.slice(0, 3).join(", ");
+					ctx.ui.notify(`Recent: ${recents}`, "info");
+				}
+
+				for (const r of RECOMMENDED) {
+					ctx.ui.notify(`  ${r.model} — ${r.hint}`, "info");
+				}
+
+				ctx.ui.notify("To change: /ocr-model <name>", "info");
 				return;
 			}
 
-			// Change model
 			const newModel = trimmed.split(/\s+/)[0];
 			setModel(newModel);
 
-			ctx.ui.setStatus(
-				"minimodel-ocr",
-				`OCR: ${newModel} @ ${config.ollamaHost}`,
-			);
-			ctx.ui.notify(`OCR model changed to: ${newModel}`, "success");
+			// Persist across sessions
+			pi.appendEntry<PersistedState>("ocr-model-config", {
+				model: newModel,
+				recentModels,
+			});
+
+			ctx.ui.setStatus("minimodel-ocr", `OCR: ${newModel} @ ${config.ollamaHost}`);
+			ctx.ui.notify(`OCR model → ${newModel}`, "success");
 		},
 	});
 
-	// Notify on startup
+	// Notify on startup — restore persisted model
 	pi.on("session_start", async (_event, ctx) => {
+		// Restore persisted model from session entries (last one wins)
+		const entries = ctx.sessionManager.getBranch();
+		for (const entry of entries) {
+			if (entry.type === "custom" && entry.customType === "ocr-model-config") {
+				const data = entry.data as PersistedState | undefined;
+				if (data?.model) {
+					currentModel = data.model;
+					recentModels = data.recentModels || [];
+				}
+			}
+		}
+
 		const config = getConfig(ctx);
 		ctx.ui.setStatus(
 			"minimodel-ocr",
