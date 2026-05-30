@@ -1,644 +1,434 @@
 /**
- * pi-minimodel-ocr — Local OCR via Ollama for Pi Coding Agent
+ * pi-minimodel-ocr — Multi-backend OCR for Pi Coding Agent
  *
  * Registers a `minimodel_ocr` tool that the LLM can call to read images and PDFs
- * using any locally running Ollama vision model (default: glm-ocr 0.9B).
+ * using one of three backends:
+ *   - Ollama (local vision models like glm-ocr)
+ *   - MinerU API (free Agent API, ≤10MB, ≤20 pages)
+ *   - PaddleOCR (local Python library)
  *
- * Supported tasks:
- *   - text    → Markdown text recognition
- *   - formula → LaTeX math formula recognition
- *   - table   → Markdown table recognition
- *   - figure  → Figure description
- *   - auto    → Full document OCR (auto-detects content)
+ * Single command:
+ *   /ocr                    → open settings UI (backend, model, split toggle)
+ *   /ocr <file> [task]      → OCR file with current settings
+ *
+ * Settings persisted to ~/.pi/agent/settings.json.
  *
  * Prerequisites:
- *   1. Install Ollama: https://ollama.com/download
- *   2. Pull a model:  ollama pull glm-ocr
- *   3. For multi-page PDF on macOS: brew install poppler
- *      For Linux: apt install poppler-utils
+ *   Ollama:     brew install ollama && ollama pull glm-ocr
+ *   MinerU:     no setup (free API, IP rate-limited)
+ *   PaddleOCR:  pip install paddleocr paddlepaddle pypdfium2
+ *   PDF tools:  brew install poppler (macOS multi-page PDF for Ollama)
  *
- * Install:
- *   pi install npm:pi-minimodel-ocr
- *   # or locally:
- *   pi -e ./extensions/index.ts
- *
- * Configuration (optional, in settings.json):
- *   { "minimodelOcr": { "ollamaHost": "http://localhost:11434", "model": "glm-ocr" } }
+ * Install: pi install npm:pi-minimodel-ocr
  */
 
 import { Type } from "@earendil-works/pi-ai";
-import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync, mkdtempSync, readdirSync, unlinkSync, rmdirSync, mkdirSync } from "node:fs";
-import { basename, extname, join, dirname } from "node:path";
-import { tmpdir, homedir } from "node:os";
+import {
+  defineTool,
+  getSettingsListTheme,
+  type ExtensionAPI,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import {
+  Container,
+  Text,
+  type SettingItem,
+  SettingsList,
+  type SelectItem,
+  SelectList,
+} from "@earendil-works/pi-tui";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { basename, extname, dirname, join } from "node:path";
+import { homedir } from "node:os";
 
-// ── Types ────────────────────────────────────────────────────────────────────
+import type { Backend, Task, OcrConfig } from "./types";
+import { TASKS, BACKENDS } from "./types";
+import { isImage, isPdf, getPdfPageCount, ollamaOcr, ollamaCheckModel, ollamaPullModel } from "./ollama";
+import { mineruOcr } from "./mineru";
+import { paddleOcr } from "./paddleocr";
 
-const TASKS = ["text", "formula", "table", "figure", "auto"] as const;
-type Task = (typeof TASKS)[number];
+// ── Config persistence ───────────────────────────────────────────────────────
 
-interface OcrConfig {
-	ollamaHost: string;
-	model: string;
+const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
+
+function loadOcrConfig(): Partial<OcrConfig> {
+  try {
+    if (!existsSync(SETTINGS_PATH)) return {};
+    return (JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as any).minimodelOcr || {};
+  } catch { return {}; }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-/** Detect if a file is a PDF by extension or magic bytes */
-function isPdf(filePath: string): boolean {
-	const ext = extname(filePath).toLowerCase();
-	if (ext === ".pdf") return true;
-	try {
-		const buf = readFileSync(filePath).subarray(0, 4);
-		return buf.toString() === "%PDF";
-	} catch {
-		return false;
-	}
+function saveOcrConfig(updates: Partial<OcrConfig>) {
+  try {
+    const dir = dirname(SETTINGS_PATH);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const settings = existsSync(SETTINGS_PATH)
+      ? JSON.parse(readFileSync(SETTINGS_PATH, "utf8"))
+      : {};
+    settings.minimodelOcr = { ...(settings.minimodelOcr || {}), ...updates };
+    writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n", "utf8");
+  } catch { /* best effort */ }
 }
 
-/** Detect if a file is an image by extension */
-function isImage(filePath: string): boolean {
-	const ext = extname(filePath).toLowerCase();
-	return [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif"].includes(ext);
+function getConfig(): OcrConfig {
+  const s = loadOcrConfig();
+  return {
+    backend: (BACKENDS.includes(s.backend as Backend) ? s.backend : "ollama") as Backend,
+    ollamaHost: process.env.OLLAMA_HOST || s.ollamaHost || "http://localhost:11434",
+    model: process.env.OCR_MODEL || s.model || "glm-ocr",
+    mineruSplitPdf: s.mineruSplitPdf !== false,
+  };
 }
 
-/** Execute a command and capture stdout. Stderr is captured in the error message. */
-function execCmdCapture(cmd: string, args: string[]): Promise<string> {
-	return new Promise((resolve, reject) => {
-		const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-		const outChunks: Buffer[] = [];
-		const errChunks: Buffer[] = [];
-		child.stdout.on("data", (d) => outChunks.push(d));
-		child.stderr.on("data", (d) => errChunks.push(d));
-		child.on("error", (e) => {
-			reject(new Error(`${cmd}: ${(e as any).code === "ENOENT" ? "command not found" : e.message}`));
-		});
-		child.on("close", (code) => {
-			const stderr = Buffer.concat(errChunks).toString("utf8").trim();
-			if (code === 0) {
-				resolve(Buffer.concat(outChunks).toString("utf8"));
-			} else {
-				reject(new Error(`${cmd} exited with code ${code}${stderr ? ": " + stderr : ""}`));
-			}
-		});
-	});
-}
+// ── Recommended models ───────────────────────────────────────────────────────
 
-function cleanupDir(dir: string) {
-	try {
-		for (const f of readdirSync(dir)) {
-			unlinkSync(join(dir, f));
-		}
-		rmdirSync(dir);
-	} catch {
-		// best effort
-	}
-}
-
-/** Build the prompt string for OCR task */
-function buildPrompt(task: Task): string {
-	switch (task) {
-		case "text":
-			return "Text Recognition";
-		case "formula":
-			return "Formula Recognition";
-		case "table":
-			return "Table Recognition";
-		case "figure":
-			return "Figure Recognition";
-		case "auto":
-			return "Recognize all text, formulas, tables, and figures in this document. Output formulas in LaTeX format, tables in Markdown format.";
-	}
-}
+const RECOMMENDED_MODELS = [
+  { name: "glm-ocr:q8_0", desc: "balanced — smallest (1.6GB), fast" },
+  { name: "glm-ocr", desc: "best formula OCR (2.2GB, 94.6 OmniDocBench)" },
+  { name: "minicpm-v", desc: "strong all-around vision + OCR (8B, 5.5GB)" },
+  { name: "llama3.2-vision", desc: "Meta's vision model (11B)" },
+];
 
 // ── Tool Definition ──────────────────────────────────────────────────────────
 
 const ocrSchema = Type.Object({
-	path: Type.String({
-		description:
-			"Absolute or relative path to the image or PDF file to OCR. Supported formats: PNG, JPG, GIF, WEBP, BMP, TIFF, PDF.",
-	}),
-	task: Type.Optional(
-		Type.String({
-			description:
-				'OCR task type. "text" for Markdown text, "formula" for LaTeX math, "table" for Markdown tables, "figure" for description, "auto" for full document OCR (default).',
-		}),
-	),
-	model: Type.Optional(
-		Type.String({
-			description:
-				"Ollama model to use for OCR. Defaults to 'glm-ocr'. You can use any Ollama vision model, e.g. 'glm-ocr:q8_0' for the 8-bit quantized version, 'llama3.2-vision', 'minicpm-v', etc.",
-		}),
-	),
+  path: Type.String({
+    description:
+      "Absolute or relative path to the image or PDF file to OCR. Supported formats: PNG, JPG, GIF, WEBP, BMP, TIFF, PDF.",
+  }),
+  task: Type.Optional(
+    Type.String({
+      description:
+        'OCR task type. "text" for Markdown text, "formula" for LaTeX math, "table" for Markdown tables, "figure" for description, "auto" for full document OCR (default).',
+    }),
+  ),
+  model: Type.Optional(
+    Type.String({
+      description:
+        "Ollama model to use for OCR. Defaults to 'glm-ocr'. You can use any Ollama vision model, e.g. 'glm-ocr:q8_0' for the 8-bit quantized version, 'llama3.2-vision', 'minicpm-v', etc.",
+    }),
+  ),
 });
 
 const ocrTool = defineTool({
-	name: "minimodel_ocr",
-	label: "Minimodel OCR",
-	description:
-		"Extract text, math formulas (LaTeX), and tables from images or PDFs using local Ollama vision models. " +
-		"Use this when you need to read text from an image or PDF, especially mathematical formulas that need LaTeX output. " +
-		"This is the tool to use when working with non-vision LLMs like DeepSeek that cannot process images directly.",
-	promptSnippet:
-		"Extract text/formulas/tables from images and PDFs using local Ollama OCR",
-	promptGuidelines: [
-		"When the user asks about the content of an image or PDF, use minimodel_ocr to extract the text first.",
-		"For mathematical documents, use minimodel_ocr with task='formula' or task='auto' to get LaTeX output.",
-		"Use minimodel_ocr with task='auto' for general document OCR to extract all text, formulas, tables, and figures.",
-	],
-	parameters: ocrSchema,
-	async execute(_toolCallId, params, signal, onUpdate, ctx) {
-		const { path: filePath, task = "auto", model: modelOverride } = params as {
-			path: string;
-			task?: string;
-			model?: string;
-		};
-		const resolvedTask = (TASKS.includes(task as Task) ? task : "auto") as Task;
+  name: "minimodel_ocr",
+  label: "Minimodel OCR",
+  description:
+    "Extract text, math formulas (LaTeX), and tables from images or PDFs using local Ollama vision models. " +
+    "Use this when you need to read text from an image or PDF, especially mathematical formulas that need LaTeX output. " +
+    "This is the tool to use when working with non-vision LLMs like DeepSeek that cannot process images directly.",
+  promptSnippet:
+    "Extract text/formulas/tables from images and PDFs using local Ollama OCR",
+  promptGuidelines: [
+    "When the user asks about the content of an image or PDF, use minimodel_ocr to extract the text first.",
+    "For mathematical documents, use minimodel_ocr with task='formula' or task='auto' to get LaTeX output.",
+    "Use minimodel_ocr with task='auto' for general document OCR to extract all text, formulas, tables, and figures.",
+  ],
+  parameters: ocrSchema,
+  async execute(_toolCallId, params, signal, onUpdate, _ctx) {
+    const { path: filePath, task = "auto", model: modelOverride } = params as {
+      path: string; task?: string; model?: string;
+    };
+    const resolvedTask = (TASKS.includes(task as Task) ? task : "auto") as Task;
+    const config = getConfig();
+    const resolvedModel = modelOverride || config.model;
 
-		// Resolve config (modelOverride takes priority over env/config)
-		const config = getConfig();
-		const resolvedModel = modelOverride || config.model;
+    if (!existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
+    if (!isImage(filePath) && !isPdf(filePath)) {
+      throw new Error(`Unsupported file type "${extname(filePath)}". Supported: PNG, JPG, GIF, WEBP, BMP, TIFF, PDF.`);
+    }
 
-		// Validate file
-		if (!existsSync(filePath)) {
-			return {
-				content: [{ type: "text", text: `Error: File not found: ${filePath}` }],
-				details: { error: "file_not_found", path: filePath },
-				isError: true,
-			};
-		}
+    const backendLabel = { ollama: "🦙 Ollama", mineru: "☁️ MinerU", paddleocr: "🐍 PaddleOCR" }[config.backend];
+    onUpdate?.({ content: [{ type: "text", text: `🔍 OCR ${basename(filePath)} via ${backendLabel} (${resolvedTask})…` }], details: {} });
 
-		if (!isImage(filePath) && !isPdf(filePath)) {
-			const ext = extname(filePath).toLowerCase();
-			return {
-				content: [
-					{
-						type: "text",
-						text: `Error: Unsupported file type "${ext}". Supported: PNG, JPG, GIF, WEBP, BMP, TIFF, PDF.`,
-					},
-				],
-				details: { error: "unsupported_format", ext, path: filePath },
-				isError: true,
-			};
-		}
+    const onProgress = (msg: string) => onUpdate?.({ content: [{ type: "text", text: msg }], details: {} });
 
-		// Progress update
-		onUpdate?.({
-			content: [{ type: "text", text: `🔍 Reading ${basename(filePath)} with ${resolvedModel} (${resolvedTask})…` }],
-			details: {},
-		});
+    try {
+      let result: { text: string; details: Record<string, unknown> };
 
-		let resultText = "";
-		let tmpDir: string | null = null;
+      switch (config.backend) {
+        case "ollama":
+          result = await ollamaOcr(filePath, resolvedTask, config.ollamaHost, resolvedModel, signal, onProgress);
+          break;
+        case "mineru": {
+          const { stat } = await import("node:fs/promises");
+          const stats = await stat(filePath);
+          if (stats.size > 10 * 1024 * 1024) {
+            onProgress(`⚠️ File is ${(stats.size / 1024 / 1024).toFixed(1)}MB. MinerU free tier limit is 10MB.\n💡 Compress at https://ilovepdf.com/compress_pdf or switch backend with /ocr.`);
+          }
+          result = await mineruOcr(filePath, resolvedTask, config.mineruSplitPdf, signal, onProgress);
+          break;
+        }
+        case "paddleocr":
+          result = await paddleOcr(filePath, resolvedTask, signal, onProgress);
+          break;
+        default:
+          throw new Error(`Unknown backend "${config.backend}"`);
+      }
 
-		try {
-			if (isPdf(filePath)) {
-				// ── PDF: convert to images first ──────────────────────────
-				onUpdate?.({
-					content: [{ type: "text", text: `📄 Converting PDF pages to images…` }],
-					details: {},
-				});
-
-				tmpDir = mkdtempSync(join(tmpdir(), "pi-ocr-"));
-
-				// Count pages and convert
-				const pageCount = await getPdfPageCount(filePath);
-
-				// Proactive check: multi-page PDF on macOS without extra tools
-				if (pageCount > 1 && process.platform === "darwin") {
-					const hasMultiPage = await checkMacMultiPageSupport();
-					if (!hasMultiPage) {
-						onUpdate?.({
-							content: [{
-								type: "text",
-								text:
-									`⚠️ Multi-page PDF detected (${pageCount} pages) but pdftoppm is not installed.\n` +
-									`Only page 1 will be processed with built-in sips.\n` +
-									`\nTo OCR all pages:\n` +
-									`  brew install poppler`,
-							}],
-							details: {},
-						});
-					}
-				}
-
-				const pageResults: string[] = [];
-
-				for (let i = 0; i < pageCount; i++) {
-					if (signal?.aborted) throw new Error("Aborted");
-
-					const pageOut = join(tmpDir, `page_${i + 1}.png`);
-
-					try {
-						await convertPdfPage(filePath, i, pageOut);
-					} catch (e: any) {
-						// Multi-page without tools → skip this page with a note
-						pageResults.push(`## Page ${i + 1}\n\n> ⚠️ Skipped: ${e.message}`);
-						continue;
-					}
-
-					onUpdate?.({
-						content: [
-							{ type: "text", text: `🔍 OCR page ${i + 1}/${pageCount}…` },
-						],
-						details: {},
-					});
-
-					const pageText = await callOcr(config, pageOut, resolvedTask, signal, resolvedModel);
-					if (!pageText.trim()) {
-						pageResults.push(`## Page ${i + 1}\n\n> ⚠️ OCR returned empty result for this page.`);
-					} else {
-						pageResults.push(`## Page ${i + 1}\n\n${pageText}`);
-					}
-				}
-
-				resultText = pageResults.join("\n\n");
-			} else {
-				// ── Image: process directly ───────────────────────────────
-				resultText = await callOcr(config, filePath, resolvedTask, signal, resolvedModel);
-			}
-
-			// Build summary
-			const preview = resultText.length > 5000 ? resultText.slice(0, 5000) + "\n\n… (truncated)" : resultText;
-
-			return {
-				content: [
-					{
-						type: "text",
-						text: `## OCR Result (${resolvedTask})\n\n**File:** \`${basename(filePath)}\`\n\n${preview}`,
-					},
-				],
-				details: {
-					task: resolvedTask,
-					path: filePath,
-					fullText: resultText,
-					truncated: resultText.length > 5000,
-					model: resolvedModel,
-				},
-			};
-		} catch (e: any) {
-			return {
-				content: [
-					{ type: "text", text: `Error during OCR: ${e.message || String(e)}` },
-				],
-				details: { error: "ocr_failed", message: e.message, path: filePath },
-				isError: true,
-			};
-		} finally {
-			if (tmpDir) cleanupDir(tmpDir);
-		}
-	},
+      const preview = result.text.length > 5000 ? result.text.slice(0, 5000) + "\n\n… (truncated)" : result.text;
+      return {
+        content: [{ type: "text", text: `## OCR Result (${resolvedTask})\n\n**File:** \`${basename(filePath)}\`\n**Backend:** ${config.backend}\n\n${preview}` }],
+        details: { task: resolvedTask, path: filePath, fullText: result.text, truncated: result.text.length > 5000, backend: config.backend, ...result.details },
+      };
+    } catch (e: any) {
+      const msg = e.message || String(e);
+      let hint = "";
+      if (config.backend === "ollama" && (msg.includes("fetch failed") || msg.includes("ECONNREFUSED"))) hint = "\n\n💡 Is Ollama running? Start: `ollama serve`";
+      else if (config.backend === "paddleocr" && msg.includes("python3")) hint = "\n\n💡 Install: `pip install paddleocr paddlepaddle pypdfium2`";
+      else if (config.backend === "mineru" && msg.includes("429")) hint = "\n\n💡 MinerU rate limit. Wait a minute or switch backend with /ocr.";
+      else if (config.backend === "mineru" && msg.includes("too large")) hint = "\n\n💡 Compress at https://ilovepdf.com/compress_pdf or switch backend.";
+      throw new Error(`OCR error (${config.backend}): ${msg}${hint}`);
+    }
+  },
 });
-
-// ── Config ───────────────────────────────────────────────────────────────────
-
-/** Recommended models with brief usage hints (all verifiable on ollama.com) */
-const RECOMMENDED: { model: string; hint: string }[] = [
-	{ model: "glm-ocr:q8_0", hint: "balanced — smallest (1.6GB), fast" },
-	{ model: "glm-ocr", hint: "best formula OCR (2.2GB, 94.6 OmniDocBench)" },
-	{ model: "minicpm-v", hint: "strong all-around vision + OCR (8B, 5.5GB)" },
-];
-
-const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
-
-export function loadSettingsModel(): string | undefined {
-	try {
-		if (!existsSync(SETTINGS_PATH)) return undefined;
-		const raw = readFileSync(SETTINGS_PATH, "utf8");
-		const settings = JSON.parse(raw);
-		return settings?.minimodelOcr?.model;
-	} catch {
-		return undefined;
-	}
-}
-
-function saveSettingsModel(model: string): void {
-	try {
-		const dir = dirname(SETTINGS_PATH);
-		if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-		let settings: any = {};
-		if (existsSync(SETTINGS_PATH)) {
-			settings = JSON.parse(readFileSync(SETTINGS_PATH, "utf8"));
-		}
-		settings.minimodelOcr = { ...(settings.minimodelOcr || {}), model };
-		writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n", "utf8");
-	} catch { /* best effort */ }
-}
-
-let ollamaHost: string | null = null;
-
-function getConfig(): OcrConfig {
-	if (ollamaHost === null) {
-		ollamaHost = process.env.OLLAMA_HOST || "http://localhost:11434";
-	}
-	// Priority: env var > settings.json > default
-	const model = process.env.OCR_MODEL || loadSettingsModel() || "glm-ocr";
-	return { ollamaHost, model };
-}
-
-function setModel(model: string): void {
-	process.env.OCR_MODEL = model;
-	saveSettingsModel(model);
-}
-
-/** Check if a model exists locally via Ollama API. Returns true if pulled. */
-async function checkModelExists(host: string, model: string): Promise<boolean> {
-	try {
-		const resp = await fetch(`${host}/api/show`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ name: model }),
-		});
-		return resp.ok;
-	} catch {
-		return false;
-	}
-}
-
-/** Pull a model via `ollama pull` */
-async function pullModel(model: string): Promise<void> {
-	await execCmdCapture("ollama", ["pull", model]);
-}
-
-// ── Ollama API ──────────────────────────────────────────────────────────────
-
-async function callOcr(
-	config: OcrConfig,
-	imagePath: string,
-	task: Task,
-	signal?: AbortSignal,
-	modelOverride?: string,
-): Promise<string> {
-	const imageBase64 = readFileSync(imagePath).toString("base64");
-	const prompt = buildPrompt(task);
-	const model = modelOverride || config.model;
-
-	const body = JSON.stringify({
-		model,
-		prompt,
-		images: [imageBase64],
-		stream: false,
-	});
-
-	const response = await fetch(`${config.ollamaHost}/api/generate`, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body,
-		signal,
-	});
-
-	if (!response.ok) {
-		const text = await response.text().catch(() => "");
-		throw new Error(
-			`Ollama API error ${response.status}: ${text.slice(0, 200)}. Is Ollama running and is the ${model} model pulled?`,
-		);
-	}
-
-	const data = (await response.json()) as { response?: string; error?: string };
-
-	if (data.error) {
-		throw new Error(`OCR error: ${data.error}`);
-	}
-
-	return data.response?.trim() || "";
-}
-
-// ── PDF Helpers ─────────────────────────────────────────────────────────────
-
-async function getPdfPageCount(pdfPath: string): Promise<number> {
-	if (process.platform === "darwin") {
-		try {
-			const out = await execCmdCapture("mdls", ["-name", "kMDItemNumberOfPages", "-raw", pdfPath]);
-			const n = parseInt(out.trim(), 10);
-			if (!isNaN(n) && n > 0) return n;
-		} catch { /* fall through */ }
-	}
-
-	if (process.platform === "linux") {
-		try {
-			const out = await execCmdCapture("pdfinfo", [pdfPath]);
-			const m = out.match(/Pages:\s+(\d+)/);
-			if (m) return parseInt(m[1], 10) || 1;
-		} catch { /* fall through */ }
-	}
-
-	return 1;
-}
-
-/**
- * Convert a single PDF page to PNG.
- * - macOS: tries sips (built-in), then pdftoppm (brew)
- * - Linux: uses pdftoppm (poppler-utils)
- */
-async function convertPdfPage(pdfPath: string, pageIndex: number, outPath: string): Promise<void> {
-	if (process.platform === "darwin") {
-		await convertPdfPageMac(pdfPath, pageIndex, outPath);
-	} else {
-		await execCmdCapture("pdftoppm", [
-			"-png", "-r", "150",
-			"-f", String(pageIndex + 1),
-			"-l", String(pageIndex + 1),
-			"-singlefile",
-			pdfPath,
-			outPath.replace(/\.png$/, ""),
-		]);
-	}
-}
-
-/** Check if macOS has multi-page PDF support (pdftoppm). Cached. */
-let macMultiPageCheck: { done: boolean; available: boolean } | null = null;
-
-async function checkMacMultiPageSupport(): Promise<boolean> {
-	if (macMultiPageCheck?.done) return macMultiPageCheck.available;
-
-	try {
-		await execCmdCapture("pdftoppm", ["-v"]);
-		macMultiPageCheck = { done: true, available: true };
-		return true;
-	} catch {}
-
-	macMultiPageCheck = { done: true, available: false };
-	return false;
-}
-
-/** macOS PDF page → PNG: tries multiple methods in priority order */
-async function convertPdfPageMac(pdfPath: string, pageIndex: number, outPath: string): Promise<void> {
-	if (pageIndex === 0) {
-		try {
-			await execCmdCapture("sips", [
-				"-s", "format", "png",
-				pdfPath,
-				"--out", outPath,
-			]);
-			return;
-		} catch (e: any) {
-			throw new Error(`sips PDF conversion failed: ${e.message}`);
-		}
-	}
-
-	// Page > 0: use pdftoppm
-	try {
-		await execCmdCapture("pdftoppm", [
-			"-png", "-r", "150",
-			"-f", String(pageIndex + 1),
-			"-l", String(pageIndex + 1),
-			"-singlefile",
-			pdfPath,
-			outPath.replace(/\.png$/, ""),
-		]);
-		// Verify the output file actually exists
-		if (!existsSync(outPath) || readFileSync(outPath).length === 0) {
-			throw new Error(`pdftoppm produced no output for page ${pageIndex + 1}`);
-		}
-		return;
-	} catch (e: any) {
-		const msg = e.message || String(e);
-		if (msg.includes("command not found") || msg.includes("ENOENT")) {
-			throw new Error(
-				`pdftoppm not found. Install with: brew install poppler. ` +
-				`Only page 1 was processed with sips.`,
-			);
-		}
-		throw new Error(`PDF page ${pageIndex + 1} conversion failed: ${msg}`);
-	}
-}
 
 // ── Extension Entry ─────────────────────────────────────────────────────────
 
 export default function ocrExtension(pi: ExtensionAPI) {
-	// Register the minimodel_ocr tool
-	pi.registerTool(ocrTool);
+  pi.registerTool(ocrTool);
 
-	// Register /ocr command for user convenience
-	pi.registerCommand("ocr", {
-		description: "OCR an image or PDF file using a local Ollama vision model",
-		handler: async (args, ctx) => {
-			const trimmed = (args || "").trim();
-			if (!trimmed) {
-				ctx.ui.notify("Usage: /ocr <file-path> [task] [model]", "info");
-				ctx.ui.notify("Tasks: text, formula, table, figure, auto (default)", "info");
-				ctx.ui.notify("Model: any Ollama vision model (default: glm-ocr)", "info");
-				return;
-			}
+  // ── /ocr command ─────────────────────────────────────────────────────────
 
-			const parts = trimmed.split(/\s+/);
-			const filePath = parts[0];
-			const task = parts[1] || "auto";
-			const model = parts[2] || undefined;
+  pi.registerCommand("ocr", {
+    description: "OCR an image or PDF, or configure OCR settings",
+    handler: async (args, ctx) => {
+      const trimmed = (args || "").trim();
 
-			if (!existsSync(filePath)) {
-				ctx.ui.notify(`File not found: ${filePath}`, "error");
-				return;
-			}
+      // No args → open settings UI
+      if (!trimmed) {
+        await showOcrSettings(ctx);
+        return;
+      }
 
-			// Call the tool directly
-			const result = await ocrTool.execute("", { path: filePath, task, model }, undefined as any, undefined, ctx);
+      // Args → OCR a file
+      const parts = trimmed.split(/\s+/);
+      const filePath = parts[0];
+      const task = parts[1] || "auto";
+      const model = parts[2] || undefined;
 
-			if (result.isError) {
-				const msg =
-					result.content
-						?.filter((c: any) => c.type === "text")
-						.map((c: any) => c.text)
-						.join("\n") || "Unknown error";
-				ctx.ui.notify(msg.slice(0, 200), "error");
-			} else {
-				const text =
-					result.content
-						?.filter((c: any) => c.type === "text")
-						.map((c: any) => c.text)
-						.join("\n") || "";
-				ctx.ui.notify(`OCR complete (${(result.details as any)?.fullText?.length || text.length} chars)`, "success");
-			}
-		},
-	});
+      if (!existsSync(filePath)) {
+        ctx.ui.notify(`File not found: ${filePath}`, "error");
+        return;
+      }
 
-	// Register /ocr-model command — select from list or type custom
-	pi.registerCommand("ocr-model", {
-		description: "View or change the OCR model (persists across sessions)",
-		handler: async (args, ctx) => {
-			const config = getConfig();
+      try {
+        const result = await ocrTool.execute("", { path: filePath, task, model }, undefined as any, undefined, ctx);
+        const textLen = (result.details as any)?.fullText?.length || 0;
+        ctx.ui.notify(`OCR complete — ${textLen} chars via ${(result.details as any)?.backend || "?"}`, "info");
+      } catch (e: any) {
+        ctx.ui.notify(e.message?.slice(0, 200) || "OCR failed", "error");
+      }
+    },
+  });
 
-			// Build select items
-			const items: string[] = [];
+  // ── Settings UI ────────────────────────────────────────────────────────────
+  //
+  // Shows a SettingsList with:
+  //   1. Backend selector (toggle: ollama / mineru / paddleocr)
+  //   2. MinerU: Split PDF >20 pages (toggle: ON / OFF)
+  //   3. Ollama model (current value shown; Enter opens model picker submenu)
+  //
+  // Changes are saved immediately to ~/.pi/agent/settings.json.
 
-			items.push(`Current: ${config.model}`);
-			items.push("");
+  async function showOcrSettings(ctx: ExtensionContext) {
+    const config = getConfig();
 
-			items.push("── Recommended ──");
-			for (const r of RECOMMENDED) {
-				items.push(`${r.model}  → ${r.hint}`);
-			}
+    const items: SettingItem[] = [
+      {
+        id: "backend",
+        label: "OCR Backend",
+        description: "Ollama=local GPU, MinerU=free cloud API, PaddleOCR=local Python",
+        currentValue: config.backend,
+        values: [...BACKENDS],
+      },
+      {
+        id: "mineruSplitPdf",
+        label: "MinerU: Split PDF >20 pages",
+        description: "Auto-split large PDFs into ≤20-page free-tier chunks",
+        currentValue: config.mineruSplitPdf ? "ON" : "OFF",
+        values: ["ON", "OFF"],
+      },
+      {
+        id: "model",
+        label: "Ollama Model",
+        description: "Vision model used for OCR (only applies to Ollama backend)",
+        currentValue: config.model,
+        submenu: (_currentValue, done) => {
+          return createModelSelector(config.model, ctx, (selected) => {
+            if (selected) {
+              saveOcrConfig({ model: selected });
+              process.env.OCR_MODEL = selected;
+              updateStatus(ctx);
+              // Update the SettingsList item value in-place
+              settingsListRef?.updateValue("model", selected);
+            }
+            done(selected);
+          });
+        },
+      },
+    ];
 
-			items.push("");
-			items.push("Type a custom name…");
+    let settingsListRef: SettingsList | null = null;
 
-			const choice = await ctx.ui.select("OCR Model — ↓↑ to navigate, Enter to pick", items);
-			if (!choice) return;
+    await new Promise<void>((resolve) => {
+      ctx.ui.custom((tui, theme, _kb, done) => {
+        const settingsList = new SettingsList(
+          items,
+          8, // max visible items
+          getSettingsListTheme(),
+          (id, newValue) => {
+            // onChange — save immediately
+            switch (id) {
+              case "backend": {
+                const backend = BACKENDS.includes(newValue as Backend) ? newValue as Backend : "ollama";
+                saveOcrConfig({ backend });
+                updateStatus(ctx);
+                // Show hints when switching
+                if (backend === "mineru") {
+                  ctx.ui.notify(
+                    "☁️ MinerU: free for ≤10MB & ≤20 pages. Auto-split " +
+                    (config.mineruSplitPdf ? "ON" : "OFF — enable in settings") +
+                    ".\nLarge files? Compress at https://ilovepdf.com/compress_pdf",
+                    "info",
+                  );
+                } else if (backend === "paddleocr") {
+                  ctx.ui.notify("🐍 PaddleOCR: needs `pip install paddleocr paddlepaddle pypdfium2`", "warning");
+                }
+                break;
+              }
+              case "mineruSplitPdf":
+                saveOcrConfig({ mineruSplitPdf: newValue === "ON" });
+                break;
+            }
+          },
+          () => done(undefined), // onCancel
+        );
 
-			// Custom input
-			if (choice === "Type a custom name…") {
-				const custom = await ctx.ui.input(
-					"Enter OCR model name",
-					config.model,
-				);
-				if (!custom?.trim()) return;
-				await applyModel(custom.trim(), config, ctx);
-				return;
-			}
+        settingsListRef = settingsList;
 
-			// Skip headers and current line
-			if (choice.startsWith("──") || choice.startsWith("Current:") || choice === "") return;
+        const container = new Container();
+        container.addChild(new Text(theme.fg("accent", theme.bold("OCR Settings")), 1, 0));
+        container.addChild(settingsList);
+        container.addChild(
+          new Text(theme.fg("dim", "↑↓ navigate • ← → toggle • enter select • esc close"), 1, 0),
+        );
 
-			// Extract model name (strip hint for recommended items)
-			const newModel = choice.includes("→") ? choice.split(/\s+→/)[0].trim() : choice.trim();
-			await applyModel(newModel, config, ctx);
-		},
-	});
+        return {
+          render(width: number) {
+            return container.render(width);
+          },
+          invalidate() {
+            container.invalidate();
+          },
+          handleInput(data: string) {
+            settingsList.handleInput(data);
+            tui.requestRender();
+          },
+        };
+      });
+    });
+  }
 
-	/** Shared apply-model logic: verify, pull if needed, save to settings.json */
-	async function applyModel(newModel: string, config: OcrConfig, ctx: ExtensionContext) {
-		const exists = await checkModelExists(config.ollamaHost, newModel);
-		if (!exists) {
-			const pull = await ctx.ui.confirm(
-				"Model not found",
-				`${newModel} is not pulled.\n\nPull it now? (ollama pull ${newModel})`,
-			);
-			if (!pull) return;
-			ctx.ui.notify(`Pulling ${newModel}…`, "info");
-			pullModel(newModel).then(() => {
-				ctx.ui.notify(`${newModel} pull complete`, "success");
-			}).catch((e) => {
-				ctx.ui.notify(`Pull failed: ${e.message}`.slice(0, 200), "error");
-			});
-		}
+  // ── Model selector submenu ─────────────────────────────────────────────────
 
-		setModel(newModel);
+  function createModelSelector(
+    currentModel: string,
+    ctx: ExtensionContext,
+    onDone: (selected: string | undefined) => void,
+  ) {
+    const items: SelectItem[] = RECOMMENDED_MODELS.map((m) => ({
+      value: m.name,
+      label: m.name === currentModel ? `${m.name} ✓` : m.name,
+      description: m.desc,
+    }));
+    items.push({
+      value: "__custom__",
+      label: "Type a custom name…",
+      description: "Enter any Ollama model name",
+    });
 
-		ctx.ui.setStatus("minimodel-ocr", `OCR: ${newModel} @ ${config.ollamaHost}`);
-		ctx.ui.notify(`OCR model → ${newModel}` + (exists ? "" : " (pulling…)"), "success");
-	}
+    const container = new Container();
+    container.addChild(new Text("Choose Ollama Model", 1, 0));
 
-	// Notify on startup
-	pi.on("session_start", async (_event, ctx) => {
-		const config = getConfig();
-		ctx.ui.setStatus(
-			"minimodel-ocr",
-			`OCR: ${config.model} @ ${config.ollamaHost}`,
-		);
+    const selectList = new SelectList(items, Math.min(items.length, 8), {
+      selectedPrefix: (text) => ctx.ui.theme.fg("accent", text),
+      selectedText: (text) => ctx.ui.theme.fg("accent", text),
+      description: (text) => ctx.ui.theme.fg("muted", text),
+      scrollInfo: (text) => ctx.ui.theme.fg("dim", text),
+      noMatch: (text) => ctx.ui.theme.fg("warning", text),
+    });
 
-		// Proactive check: warn if macOS multi-page PDF support is missing
-		if (process.platform === "darwin") {
-			checkMacMultiPageSupport().then((available) => {
-				if (!available) {
-					ctx.ui.notify(
-						"💡 Multi-page PDF OCR needs pdftoppm (brew install poppler). Page 1 uses built-in sips.",
-						"warning",
-					);
-				}
-			});
-		}
-	});
+    selectList.onSelect = async (item) => {
+      if (item.value === "__custom__") {
+        const custom = await ctx.ui.input("Enter Ollama model name:", currentModel);
+        if (custom?.trim()) {
+          await ensureModelPulled(custom.trim(), ctx);
+          onDone(custom.trim());
+        } else {
+          onDone(undefined);
+        }
+        return;
+      }
+      await ensureModelPulled(item.value, ctx);
+      onDone(item.value);
+    };
 
-	console.log("[pi-minimodel-ocr] Extension loaded. Tool: minimodel_ocr, Commands: /ocr, /ocr-model");
+    selectList.onCancel = () => onDone(undefined);
+    container.addChild(selectList);
+
+    return {
+      render(width: number) { return container.render(width); },
+      invalidate() { container.invalidate(); },
+      handleInput(data: string) { selectList.handleInput(data); },
+    };
+  }
+
+  async function ensureModelPulled(model: string, ctx: ExtensionContext) {
+    const config = getConfig();
+    const exists = await ollamaCheckModel(config.ollamaHost, model);
+    if (!exists) {
+      const pull = await ctx.ui.confirm(
+        "Model not found",
+        `"${model}" is not pulled locally.\n\nPull it now? (ollama pull ${model})`,
+      );
+      if (pull) {
+        ctx.ui.notify(`Pulling ${model}…`, "info");
+        ollamaPullModel(model)
+          .then(() => ctx.ui.notify(`${model} ready`, "info"))
+          .catch((e) => ctx.ui.notify(`Pull failed: ${e.message}`.slice(0, 200), "error"));
+      }
+    }
+  }
+
+  // ── Status bar ─────────────────────────────────────────────────────────────
+
+  function updateStatus(ctx: ExtensionContext) {
+    const config = getConfig();
+    const text = config.backend === "ollama"
+      ? `OCR: ollama ${config.model}`
+      : `OCR: ${config.backend}`;
+    ctx.ui.setStatus("minimodel-ocr", text);
+  }
+
+  // ── Startup ────────────────────────────────────────────────────────────────
+
+  pi.on("session_start", async (_event, ctx) => {
+    updateStatus(ctx);
+
+    // Proactive check: macOS multi-page PDF support
+    if (process.platform === "darwin" && getConfig().backend === "ollama") {
+      const { spawn } = await import("node:child_process");
+      const hasPdftoppm = await new Promise<boolean>((resolve) => {
+        const child = spawn("pdftoppm", ["-v"], { stdio: "ignore" });
+        child.on("close", (code) => resolve(code === 0));
+        child.on("error", () => resolve(false));
+      });
+      if (!hasPdftoppm) {
+        ctx.ui.notify("💡 Multi-page PDF via Ollama needs pdftoppm: brew install poppler", "warning");
+      }
+    }
+  });
+
+  console.log("[pi-minimodel-ocr] Loaded — /ocr (file or settings), tool: minimodel_ocr");
 }

@@ -1,7 +1,7 @@
 {
   "name": "pi-minimodel-ocr",
-  "version": "0.2.1",
-  "description": "Pi extension: Local OCR via Ollama GLM-OCR (0.9B) — convert images and PDFs to Markdown / LaTeX with high math formula accuracy. Bridges the multimodal gap for non-vision LLMs like DeepSeek.",
+  "version": "0.3.1",
+  "description": "Pi extension: Multi-backend OCR — Ollama (local GPU), MinerU (free cloud API), PaddleOCR (local Python). Extracts text, LaTeX formulas, and tables from images and PDFs. Bridges the multimodal gap for non-vision LLMs like DeepSeek.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -10,12 +10,15 @@
     "ocr",
     "glm-ocr",
     "ollama",
+    "mineru",
+    "paddleocr",
     "latex",
     "math-ocr",
     "formula-recognition",
     "image-to-text",
     "pdf-to-markdown",
-    "deepseek"
+    "deepseek",
+    "multi-backend"
   ],
   "license": "MIT",
   "author": "",
